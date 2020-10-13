@@ -1,0 +1,2608 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="342" onload="init(evt)" viewBox="0 0 1200 342" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="342.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="325" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="325" > </text>
+<g id="frames">
+<g >
+<title>_dl_lookup_symbol_x (2 samples, 0.01%)</title><rect x="23.5" y="181" width="0.1" height="15.0" fill="rgb(236,62,36)" rx="2" ry="2" />
+<text  x="26.51" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (10 samples, 0.06%)</title><rect x="100.1" y="117" width="0.7" height="15.0" fill="rgb(251,137,11)" rx="2" ry="2" />
+<text  x="103.13" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.05%)</title><rect x="1178.8" y="229" width="0.6" height="15.0" fill="rgb(231,56,54)" rx="2" ry="2" />
+<text  x="1181.84" y="239.5" ></text>
+</g>
+<g >
+<title>__ctype_init (4 samples, 0.02%)</title><rect x="1122.9" y="261" width="0.2" height="15.0" fill="rgb(205,128,33)" rx="2" ry="2" />
+<text  x="1125.85" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="50.7" y="117" width="0.2" height="15.0" fill="rgb(251,195,33)" rx="2" ry="2" />
+<text  x="53.73" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.06%)</title><rect x="1053.4" y="149" width="0.7" height="15.0" fill="rgb(211,199,34)" rx="2" ry="2" />
+<text  x="1056.42" y="159.5" ></text>
+</g>
+<g >
+<title>[libhdf5.so.200.0.0] (7 samples, 0.04%)</title><rect x="21.2" y="229" width="0.4" height="15.0" fill="rgb(236,47,33)" rx="2" ry="2" />
+<text  x="24.16" y="239.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (71 samples, 0.40%)</title><rect x="159.6" y="165" width="4.7" height="15.0" fill="rgb(224,38,33)" rx="2" ry="2" />
+<text  x="162.55" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_sum_output_MOD_accumulate_net_input (11 samples, 0.06%)</title><rect x="1026.3" y="181" width="0.8" height="15.0" fill="rgb(221,141,42)" rx="2" ry="2" />
+<text  x="1029.34" y="191.5" ></text>
+</g>
+<g >
+<title>_gfortrani_parse_format (4 samples, 0.02%)</title><rect x="1103.9" y="245" width="0.3" height="15.0" fill="rgb(224,192,48)" rx="2" ry="2" />
+<text  x="1106.90" y="255.5" ></text>
+</g>
+<g >
+<title>__ctype_b_loc (2 samples, 0.01%)</title><rect x="1180.1" y="245" width="0.1" height="15.0" fill="rgb(230,110,8)" rx="2" ry="2" />
+<text  x="1183.05" y="255.5" ></text>
+</g>
+<g >
+<title>[libhdf5.so.200.0.0] (12 samples, 0.07%)</title><rect x="12.0" y="261" width="0.8" height="15.0" fill="rgb(244,6,19)" rx="2" ry="2" />
+<text  x="15.02" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_forcing_type_MOD_forcing_diagnostics (2 samples, 0.01%)</title><rect x="1096.8" y="197" width="0.2" height="15.0" fill="rgb(249,224,0)" rx="2" ry="2" />
+<text  x="1099.84" y="207.5" ></text>
+</g>
+<g >
+<title>__brk (5 samples, 0.03%)</title><rect x="27.5" y="245" width="0.3" height="15.0" fill="rgb(249,149,24)" rx="2" ry="2" />
+<text  x="30.48" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_advect_MOD_advect_y.constprop.0 (126 samples, 0.72%)</title><rect x="1066.7" y="165" width="8.5" height="15.0" fill="rgb(210,150,54)" rx="2" ry="2" />
+<text  x="1069.73" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (4 samples, 0.02%)</title><rect x="129.3" y="85" width="0.3" height="15.0" fill="rgb(250,75,35)" rx="2" ry="2" />
+<text  x="132.30" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_sum_output_MOD_mom_sum_output_init (3 samples, 0.02%)</title><rect x="42.5" y="181" width="0.2" height="15.0" fill="rgb(241,211,18)" rx="2" ry="2" />
+<text  x="45.46" y="191.5" ></text>
+</g>
+<g >
+<title>formatted_transfer_scalar_write (4 samples, 0.02%)</title><rect x="1120.2" y="245" width="0.2" height="15.0" fill="rgb(235,46,20)" rx="2" ry="2" />
+<text  x="1123.17" y="255.5" ></text>
+</g>
+<g >
+<title>strcmp (7 samples, 0.04%)</title><rect x="1172.5" y="261" width="0.4" height="15.0" fill="rgb(217,116,49)" rx="2" ry="2" />
+<text  x="1175.46" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_real (2 samples, 0.01%)</title><rect x="39.6" y="149" width="0.1" height="15.0" fill="rgb(228,199,44)" rx="2" ry="2" />
+<text  x="42.57" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_f_kb_to_ea_kb (2 samples, 0.01%)</title><rect x="90.9" y="133" width="0.1" height="15.0" fill="rgb(205,45,52)" rx="2" ry="2" />
+<text  x="93.86" y="143.5" ></text>
+</g>
+<g >
+<title>__parse_one_specmb (2 samples, 0.01%)</title><rect x="1100.5" y="245" width="0.2" height="15.0" fill="rgb(245,156,18)" rx="2" ry="2" />
+<text  x="1103.54" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_restart_MOD_restart_init (2 samples, 0.01%)</title><rect x="1097.9" y="181" width="0.1" height="15.0" fill="rgb(225,104,47)" rx="2" ry="2" />
+<text  x="1100.85" y="191.5" ></text>
+</g>
+<g >
+<title>H5MF__find_sect (2 samples, 0.01%)</title><rect x="20.7" y="229" width="0.1" height="15.0" fill="rgb(221,170,22)" rx="2" ry="2" />
+<text  x="23.69" y="239.5" ></text>
+</g>
+<g >
+<title>__benchmark_initialization_MOD_benchmark_initialize_thickness (7 samples, 0.04%)</title><rect x="41.7" y="165" width="0.5" height="15.0" fill="rgb(244,40,10)" rx="2" ry="2" />
+<text  x="44.72" y="175.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (9 samples, 0.05%)</title><rect x="1184.6" y="261" width="0.6" height="15.0" fill="rgb(234,216,26)" rx="2" ry="2" />
+<text  x="1187.62" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (5 samples, 0.03%)</title><rect x="40.7" y="149" width="0.4" height="15.0" fill="rgb(239,184,9)" rx="2" ry="2" />
+<text  x="43.72" y="159.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_irecv (3 samples, 0.02%)</title><rect x="23.7" y="213" width="0.2" height="15.0" fill="rgb(227,5,2)" rx="2" ry="2" />
+<text  x="26.71" y="223.5" ></text>
+</g>
+<g >
+<title>_dl_relocate_object (5 samples, 0.03%)</title><rect x="1102.3" y="213" width="0.3" height="15.0" fill="rgb(246,1,36)" rx="2" ry="2" />
+<text  x="1105.29" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_bulk_mixed_layer_MOD_bulkmixedlayer (195 samples, 1.11%)</title><rect x="60.4" y="149" width="13.1" height="15.0" fill="rgb(244,78,12)" rx="2" ry="2" />
+<text  x="63.41" y="159.5" ></text>
+</g>
+<g >
+<title>_int_malloc (2 samples, 0.01%)</title><rect x="1186.2" y="261" width="0.1" height="15.0" fill="rgb(236,224,25)" rx="2" ry="2" />
+<text  x="1189.17" y="271.5" ></text>
+</g>
+<g >
+<title>__mpp_mod_MOD_mpp_sync_self (2 samples, 0.01%)</title><rect x="1100.2" y="245" width="0.1" height="15.0" fill="rgb(253,195,6)" rx="2" ry="2" />
+<text  x="1103.20" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="1097.6" y="165" width="0.1" height="15.0" fill="rgb(220,54,22)" rx="2" ry="2" />
+<text  x="1100.58" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (20 samples, 0.11%)</title><rect x="101.1" y="101" width="1.3" height="15.0" fill="rgb(224,141,0)" rx="2" ry="2" />
+<text  x="104.07" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_register_diag_field (2 samples, 0.01%)</title><rect x="31.9" y="165" width="0.1" height="15.0" fill="rgb(214,106,52)" rx="2" ry="2" />
+<text  x="34.91" y="175.5" ></text>
+</g>
+<g >
+<title>_dl_start (4 samples, 0.02%)</title><rect x="1146.2" y="245" width="0.2" height="15.0" fill="rgb(235,96,21)" rx="2" ry="2" />
+<text  x="1149.18" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1185.0" y="213" width="0.2" height="15.0" fill="rgb(249,117,9)" rx="2" ry="2" />
+<text  x="1187.96" y="223.5" ></text>
+</g>
+<g >
+<title>__strlen_avx2 (5 samples, 0.03%)</title><rect x="1101.1" y="245" width="0.3" height="15.0" fill="rgb(219,157,35)" rx="2" ry="2" />
+<text  x="1104.08" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="247.1" y="101" width="0.4" height="15.0" fill="rgb(221,111,13)" rx="2" ry="2" />
+<text  x="250.13" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_forcing_type_MOD_get_net_mass_forcing (2 samples, 0.01%)</title><rect x="1097.2" y="181" width="0.1" height="15.0" fill="rgb(230,133,5)" rx="2" ry="2" />
+<text  x="1100.18" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (2 samples, 0.01%)</title><rect x="69.1" y="101" width="0.2" height="15.0" fill="rgb(241,35,37)" rx="2" ry="2" />
+<text  x="72.15" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="43.1" y="165" width="0.2" height="15.0" fill="rgb(211,37,31)" rx="2" ry="2" />
+<text  x="46.14" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1185.0" y="197" width="0.2" height="15.0" fill="rgb(233,83,40)" rx="2" ry="2" />
+<text  x="1187.96" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (5 samples, 0.03%)</title><rect x="35.5" y="133" width="0.4" height="15.0" fill="rgb(219,71,28)" rx="2" ry="2" />
+<text  x="38.54" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="19.7" y="229" width="0.5" height="15.0" fill="rgb(216,4,32)" rx="2" ry="2" />
+<text  x="22.75" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="27.7" y="181" width="0.1" height="15.0" fill="rgb(224,183,46)" rx="2" ry="2" />
+<text  x="30.68" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_hor_visc_MOD_hor_visc_init (7 samples, 0.04%)</title><rect x="36.8" y="165" width="0.5" height="15.0" fill="rgb(234,129,17)" rx="2" ry="2" />
+<text  x="39.82" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="247.3" y="69" width="0.2" height="15.0" fill="rgb(248,143,23)" rx="2" ry="2" />
+<text  x="250.33" y="79.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.1 (12 samples, 0.07%)</title><rect x="85.6" y="117" width="0.8" height="15.0" fill="rgb(223,104,9)" rx="2" ry="2" />
+<text  x="88.62" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1189.5" y="213" width="0.2" height="15.0" fill="rgb(222,185,33)" rx="2" ry="2" />
+<text  x="1192.53" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_continuity_ppm_init (3 samples, 0.02%)</title><rect x="36.4" y="165" width="0.2" height="15.0" fill="rgb(252,69,46)" rx="2" ry="2" />
+<text  x="39.41" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="1097.9" y="165" width="0.1" height="15.0" fill="rgb(208,223,14)" rx="2" ry="2" />
+<text  x="1100.85" y="175.5" ></text>
+</g>
+<g >
+<title>dl_main (10 samples, 0.06%)</title><rect x="1102.0" y="229" width="0.6" height="15.0" fill="rgb(246,30,28)" rx="2" ry="2" />
+<text  x="1104.95" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="75.7" y="133" width="0.3" height="15.0" fill="rgb(213,1,29)" rx="2" ry="2" />
+<text  x="78.67" y="143.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (2 samples, 0.01%)</title><rect x="66.1" y="133" width="0.1" height="15.0" fill="rgb(234,96,32)" rx="2" ry="2" />
+<text  x="69.06" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (10 samples, 0.06%)</title><rect x="817.1" y="133" width="0.7" height="15.0" fill="rgb(215,194,1)" rx="2" ry="2" />
+<text  x="820.10" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1152.9" y="229" width="0.3" height="15.0" fill="rgb(224,227,50)" rx="2" ry="2" />
+<text  x="1155.90" y="239.5" ></text>
+</g>
+<g >
+<title>MOM6 (17,334 samples, 98.74%)</title><rect x="10.0" y="277" width="1165.1" height="15.0" fill="rgb(206,86,41)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" >MOM6</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="42.3" y="149" width="0.1" height="15.0" fill="rgb(211,102,3)" rx="2" ry="2" />
+<text  x="45.26" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (95 samples, 0.54%)</title><rect x="1176.4" y="261" width="6.4" height="15.0" fill="rgb(220,38,40)" rx="2" ry="2" />
+<text  x="1179.42" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1057.3" y="117" width="0.2" height="15.0" fill="rgb(224,211,54)" rx="2" ry="2" />
+<text  x="1060.25" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_registry_MOD_register_tracer_diagnostics (2 samples, 0.01%)</title><rect x="43.3" y="181" width="0.2" height="15.0" fill="rgb(234,115,38)" rx="2" ry="2" />
+<text  x="46.34" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_wave_speed_MOD_wave_speed (57 samples, 0.32%)</title><rect x="1012.0" y="165" width="3.8" height="15.0" fill="rgb(249,183,54)" rx="2" ry="2" />
+<text  x="1015.02" y="175.5" ></text>
+</g>
+<g >
+<title>__GI_____strtoull_l_internal (2 samples, 0.01%)</title><rect x="1179.8" y="245" width="0.1" height="15.0" fill="rgb(253,187,47)" rx="2" ry="2" />
+<text  x="1182.78" y="255.5" ></text>
+</g>
+<g >
+<title>strcmp (5 samples, 0.03%)</title><rect x="1189.7" y="261" width="0.3" height="15.0" fill="rgb(232,176,50)" rx="2" ry="2" />
+<text  x="1192.66" y="271.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned (2 samples, 0.01%)</title><rect x="158.3" y="165" width="0.1" height="15.0" fill="rgb(235,11,49)" rx="2" ry="2" />
+<text  x="161.27" y="175.5" ></text>
+</g>
+<g >
+<title>__mpp_domains_mod_MOD_mpp_do_group_update_r8 (7 samples, 0.04%)</title><rect x="1099.1" y="245" width="0.5" height="15.0" fill="rgb(243,116,14)" rx="2" ry="2" />
+<text  x="1102.13" y="255.5" ></text>
+</g>
+<g >
+<title>MAIN__ (15,900 samples, 90.57%)</title><rect x="29.5" y="213" width="1068.7" height="15.0" fill="rgb(213,7,35)" rx="2" ry="2" />
+<text  x="32.49" y="223.5" >MAIN__</text>
+</g>
+<g >
+<title>strcmp (2 samples, 0.01%)</title><rect x="1182.7" y="245" width="0.1" height="15.0" fill="rgb(212,24,2)" rx="2" ry="2" />
+<text  x="1185.67" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_ea_kb.constprop.0 (26 samples, 0.15%)</title><rect x="84.7" y="133" width="1.7" height="15.0" fill="rgb(249,198,34)" rx="2" ry="2" />
+<text  x="87.67" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_diag_masks_set (2 samples, 0.01%)</title><rect x="33.7" y="181" width="0.1" height="15.0" fill="rgb(245,26,52)" rx="2" ry="2" />
+<text  x="36.66" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_thickness_diffuse_MOD_thickness_diffuse_init (3 samples, 0.02%)</title><rect x="42.7" y="181" width="0.2" height="15.0" fill="rgb(239,214,36)" rx="2" ry="2" />
+<text  x="45.67" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_opacity_MOD_extract_optics_slice (14 samples, 0.08%)</title><rect x="72.6" y="133" width="0.9" height="15.0" fill="rgb(252,59,16)" rx="2" ry="2" />
+<text  x="75.58" y="143.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (2 samples, 0.01%)</title><rect x="1119.9" y="245" width="0.1" height="15.0" fill="rgb(230,207,40)" rx="2" ry="2" />
+<text  x="1122.90" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_coms_MOD_increment_ints_faster (35 samples, 0.20%)</title><rect x="1027.4" y="165" width="2.4" height="15.0" fill="rgb(227,79,6)" rx="2" ry="2" />
+<text  x="1030.41" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (17 samples, 0.10%)</title><rect x="68.0" y="133" width="1.1" height="15.0" fill="rgb(254,21,13)" rx="2" ry="2" />
+<text  x="71.01" y="143.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (9 samples, 0.05%)</title><rect x="97.8" y="133" width="0.7" height="15.0" fill="rgb(246,2,5)" rx="2" ry="2" />
+<text  x="100.85" y="143.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_len_trim (4 samples, 0.02%)</title><rect x="40.8" y="133" width="0.3" height="15.0" fill="rgb(239,167,26)" rx="2" ry="2" />
+<text  x="43.78" y="143.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_isend (4 samples, 0.02%)</title><rect x="23.9" y="213" width="0.3" height="15.0" fill="rgb(233,111,51)" rx="2" ry="2" />
+<text  x="26.91" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_flux_adjust.constprop.0 (741 samples, 4.22%)</title><rect x="515.8" y="133" width="49.8" height="15.0" fill="rgb(206,107,18)" rx="2" ry="2" />
+<text  x="518.78" y="143.5" >__mom..</text>
+</g>
+<g >
+<title>malloc (195 samples, 1.11%)</title><rect x="1158.4" y="261" width="13.1" height="15.0" fill="rgb(239,205,18)" rx="2" ry="2" />
+<text  x="1161.41" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_opacity_MOD_opacity_init (2 samples, 0.01%)</title><rect x="32.3" y="165" width="0.1" height="15.0" fill="rgb(213,40,42)" rx="2" ry="2" />
+<text  x="35.31" y="175.5" ></text>
+</g>
+<g >
+<title>__strlen_avx2 (6 samples, 0.03%)</title><rect x="1181.1" y="245" width="0.4" height="15.0" fill="rgb(247,140,24)" rx="2" ry="2" />
+<text  x="1184.06" y="255.5" ></text>
+</g>
+<g >
+<title>_dl_cache_libcmp (2 samples, 0.01%)</title><rect x="1186.0" y="245" width="0.2" height="15.0" fill="rgb(254,197,12)" rx="2" ry="2" />
+<text  x="1189.03" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.07%)</title><rect x="1178.8" y="245" width="0.8" height="15.0" fill="rgb(250,223,16)" rx="2" ry="2" />
+<text  x="1181.84" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="31.0" y="165" width="0.1" height="15.0" fill="rgb(213,217,52)" rx="2" ry="2" />
+<text  x="33.97" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_find_maxf_kb (18 samples, 0.10%)</title><rect x="91.0" y="133" width="1.2" height="15.0" fill="rgb(236,53,53)" rx="2" ry="2" />
+<text  x="93.99" y="143.5" ></text>
+</g>
+<g >
+<title>sysmalloc (4 samples, 0.02%)</title><rect x="1172.9" y="261" width="0.3" height="15.0" fill="rgb(247,218,33)" rx="2" ry="2" />
+<text  x="1175.93" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_sum_output_MOD_write_energy (40 samples, 0.23%)</title><rect x="1027.1" y="181" width="2.7" height="15.0" fill="rgb(228,188,27)" rx="2" ry="2" />
+<text  x="1030.07" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_find_face_areas (8 samples, 0.05%)</title><rect x="252.9" y="149" width="0.5" height="15.0" fill="rgb(238,7,13)" rx="2" ry="2" />
+<text  x="255.91" y="159.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (2 samples, 0.01%)</title><rect x="838.0" y="149" width="0.1" height="15.0" fill="rgb(249,32,18)" rx="2" ry="2" />
+<text  x="841.00" y="159.5" ></text>
+</g>
+<g >
+<title>__mpp_domains_mod_MOD_mpp_do_update_r8_3d.constprop.0 (11 samples, 0.06%)</title><rect x="1143.3" y="261" width="0.7" height="15.0" fill="rgb(222,65,35)" rx="2" ry="2" />
+<text  x="1146.29" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (10 samples, 0.06%)</title><rect x="92.3" y="117" width="0.6" height="15.0" fill="rgb(227,35,29)" rx="2" ry="2" />
+<text  x="95.27" y="127.5" ></text>
+</g>
+<g >
+<title>_gfortrani_internal_pack_r8 (4 samples, 0.02%)</title><rect x="1103.4" y="245" width="0.2" height="15.0" fill="rgb(225,122,25)" rx="2" ry="2" />
+<text  x="1106.36" y="255.5" ></text>
+</g>
+<g >
+<title>[mca_pml_ob1.so] (6 samples, 0.03%)</title><rect x="21.6" y="229" width="0.4" height="15.0" fill="rgb(237,75,12)" rx="2" ry="2" />
+<text  x="24.63" y="239.5" ></text>
+</g>
+<g >
+<title>_int_free (8 samples, 0.05%)</title><rect x="128.2" y="117" width="0.5" height="15.0" fill="rgb(209,209,38)" rx="2" ry="2" />
+<text  x="131.16" y="127.5" ></text>
+</g>
+<g >
+<title>strcmp (4 samples, 0.02%)</title><rect x="1121.9" y="245" width="0.3" height="15.0" fill="rgb(219,199,10)" rx="2" ry="2" />
+<text  x="1124.91" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1057.3" y="133" width="0.2" height="15.0" fill="rgb(218,225,34)" rx="2" ry="2" />
+<text  x="1060.25" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (3 samples, 0.02%)</title><rect x="31.6" y="149" width="0.2" height="15.0" fill="rgb(248,207,32)" rx="2" ry="2" />
+<text  x="34.64" y="159.5" ></text>
+</g>
+<g >
+<title>pow (5 samples, 0.03%)</title><rect x="1011.3" y="165" width="0.4" height="15.0" fill="rgb(213,194,30)" rx="2" ry="2" />
+<text  x="1014.35" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.03%)</title><rect x="1184.8" y="229" width="0.4" height="15.0" fill="rgb(224,7,50)" rx="2" ry="2" />
+<text  x="1187.82" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_set_diffusivity_MOD_set_diffusivity_init (16 samples, 0.09%)</title><rect x="32.5" y="165" width="1.1" height="15.0" fill="rgb(224,220,10)" rx="2" ry="2" />
+<text  x="35.52" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="97.7" y="101" width="0.1" height="15.0" fill="rgb(242,30,27)" rx="2" ry="2" />
+<text  x="100.71" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (8 samples, 0.05%)</title><rect x="92.4" y="101" width="0.5" height="15.0" fill="rgb(207,161,7)" rx="2" ry="2" />
+<text  x="95.40" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.0 (8 samples, 0.05%)</title><rect x="87.0" y="117" width="0.6" height="15.0" fill="rgb(228,79,33)" rx="2" ry="2" />
+<text  x="90.03" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="75.9" y="117" width="0.1" height="15.0" fill="rgb(240,72,5)" rx="2" ry="2" />
+<text  x="78.87" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (3 samples, 0.02%)</title><rect x="38.2" y="165" width="0.2" height="15.0" fill="rgb(245,27,2)" rx="2" ry="2" />
+<text  x="41.23" y="175.5" ></text>
+</g>
+<g >
+<title>malloc (3 samples, 0.02%)</title><rect x="127.9" y="101" width="0.2" height="15.0" fill="rgb(244,87,48)" rx="2" ry="2" />
+<text  x="130.89" y="111.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (7 samples, 0.04%)</title><rect x="1180.3" y="245" width="0.4" height="15.0" fill="rgb(244,122,35)" rx="2" ry="2" />
+<text  x="1183.25" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (82 samples, 0.47%)</title><rect x="805.0" y="117" width="5.5" height="15.0" fill="rgb(216,127,34)" rx="2" ry="2" />
+<text  x="808.00" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="52.3" y="101" width="0.3" height="15.0" fill="rgb(248,141,53)" rx="2" ry="2" />
+<text  x="55.34" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (4 samples, 0.02%)</title><rect x="804.4" y="117" width="0.3" height="15.0" fill="rgb(239,106,14)" rx="2" ry="2" />
+<text  x="807.40" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_opacity_MOD_absorbremainingsw (28 samples, 0.16%)</title><rect x="70.7" y="133" width="1.9" height="15.0" fill="rgb(206,140,16)" rx="2" ry="2" />
+<text  x="73.69" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1057.3" y="85" width="0.2" height="15.0" fill="rgb(224,138,47)" rx="2" ry="2" />
+<text  x="1060.32" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_coord_initialization_MOD_mom_initialize_coord (3 samples, 0.02%)</title><rect x="31.1" y="181" width="0.2" height="15.0" fill="rgb(207,68,53)" rx="2" ry="2" />
+<text  x="34.11" y="191.5" ></text>
+</g>
+<g >
+<title>__mpp_mod_MOD_system_clock_mpi (2 samples, 0.01%)</title><rect x="1144.8" y="261" width="0.2" height="15.0" fill="rgb(206,30,28)" rx="2" ry="2" />
+<text  x="1147.83" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="26.7" y="165" width="0.2" height="15.0" fill="rgb(252,135,33)" rx="2" ry="2" />
+<text  x="29.67" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_diabatic_aux_MOD_find_uv_at_h (37 samples, 0.21%)</title><rect x="73.5" y="149" width="2.5" height="15.0" fill="rgb(252,29,25)" rx="2" ry="2" />
+<text  x="76.52" y="159.5" ></text>
+</g>
+<g >
+<title>H5SL_search (26 samples, 0.15%)</title><rect x="15.8" y="245" width="1.7" height="15.0" fill="rgb(234,20,12)" rx="2" ry="2" />
+<text  x="18.78" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_MOD_extract_surface_state (17 samples, 0.10%)</title><rect x="50.9" y="181" width="1.2" height="15.0" fill="rgb(225,162,6)" rx="2" ry="2" />
+<text  x="53.93" y="191.5" ></text>
+</g>
+<g >
+<title>__strlen_avx2 (2 samples, 0.01%)</title><rect x="1185.8" y="261" width="0.1" height="15.0" fill="rgb(236,111,49)" rx="2" ry="2" />
+<text  x="1188.77" y="271.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (50 samples, 0.28%)</title><rect x="473.6" y="133" width="3.4" height="15.0" fill="rgb(225,103,20)" rx="2" ry="2" />
+<text  x="476.64" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (24 samples, 0.14%)</title><rect x="1054.8" y="117" width="1.6" height="15.0" fill="rgb(218,162,43)" rx="2" ry="2" />
+<text  x="1057.77" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="50.7" y="133" width="0.2" height="15.0" fill="rgb(247,107,30)" rx="2" ry="2" />
+<text  x="53.73" y="143.5" ></text>
+</g>
+<g >
+<title>_dl_map_object (3 samples, 0.02%)</title><rect x="1186.0" y="261" width="0.2" height="15.0" fill="rgb(220,7,13)" rx="2" ry="2" />
+<text  x="1188.97" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_set_visc_MOD_set_visc_init (6 samples, 0.03%)</title><rect x="40.7" y="181" width="0.4" height="15.0" fill="rgb(239,105,43)" rx="2" ry="2" />
+<text  x="43.72" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_domains_MOD_mom_domains_init (3 samples, 0.02%)</title><rect x="35.1" y="181" width="0.2" height="15.0" fill="rgb(221,44,0)" rx="2" ry="2" />
+<text  x="38.14" y="191.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (2 samples, 0.01%)</title><rect x="31.0" y="181" width="0.1" height="15.0" fill="rgb(213,214,35)" rx="2" ry="2" />
+<text  x="33.97" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (7 samples, 0.04%)</title><rect x="1015.4" y="149" width="0.4" height="15.0" fill="rgb(214,77,0)" rx="2" ry="2" />
+<text  x="1018.38" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_set_diffusivity_MOD_set_density_ratios (6 samples, 0.03%)</title><rect x="129.2" y="133" width="0.4" height="15.0" fill="rgb(226,169,1)" rx="2" ry="2" />
+<text  x="132.17" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (23 samples, 0.13%)</title><rect x="100.9" y="133" width="1.5" height="15.0" fill="rgb(246,188,3)" rx="2" ry="2" />
+<text  x="103.87" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_real (2 samples, 0.01%)</title><rect x="37.1" y="133" width="0.1" height="15.0" fill="rgb(254,140,34)" rx="2" ry="2" />
+<text  x="40.09" y="143.5" ></text>
+</g>
+<g >
+<title>all (17,556 samples, 100%)</title><rect x="10.0" y="293" width="1180.0" height="15.0" fill="rgb(207,202,30)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" ></text>
+</g>
+<g >
+<title>__libc_fork (4 samples, 0.02%)</title><rect x="1128.7" y="261" width="0.3" height="15.0" fill="rgb(210,150,43)" rx="2" ry="2" />
+<text  x="1131.70" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_isopycnal_slopes_MOD_vert_fill_ts (16 samples, 0.09%)</title><rect x="1056.4" y="149" width="1.1" height="15.0" fill="rgb(221,156,31)" rx="2" ry="2" />
+<text  x="1059.38" y="159.5" ></text>
+</g>
+<g >
+<title>_IO_fgets (4 samples, 0.02%)</title><rect x="1182.8" y="261" width="0.3" height="15.0" fill="rgb(208,207,26)" rx="2" ry="2" />
+<text  x="1185.81" y="271.5" ></text>
+</g>
+<g >
+<title>[libhwloc.so.15.2.0] (19 samples, 0.11%)</title><rect x="1176.4" y="245" width="1.3" height="15.0" fill="rgb(254,62,30)" rx="2" ry="2" />
+<text  x="1179.42" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (17 samples, 0.10%)</title><rect x="158.4" y="165" width="1.2" height="15.0" fill="rgb(221,210,27)" rx="2" ry="2" />
+<text  x="161.41" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_state_initialization_MOD_mom_initialize_state (19 samples, 0.11%)</title><rect x="41.2" y="181" width="1.3" height="15.0" fill="rgb(252,222,27)" rx="2" ry="2" />
+<text  x="44.19" y="191.5" ></text>
+</g>
+<g >
+<title>start_thread (5 samples, 0.03%)</title><rect x="1189.3" y="261" width="0.4" height="15.0" fill="rgb(233,154,40)" rx="2" ry="2" />
+<text  x="1192.33" y="271.5" ></text>
+</g>
+<g >
+<title>OPAL_MCA_PMIX3X_pmix_ptl_base_recv_blocking (2 samples, 0.01%)</title><rect x="11.7" y="261" width="0.1" height="15.0" fill="rgb(224,175,5)" rx="2" ry="2" />
+<text  x="14.68" y="271.5" ></text>
+</g>
+<g >
+<title>dl_open_worker (8 samples, 0.05%)</title><rect x="1187.1" y="261" width="0.5" height="15.0" fill="rgb(247,60,46)" rx="2" ry="2" />
+<text  x="1190.11" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (2 samples, 0.01%)</title><rect x="69.1" y="117" width="0.2" height="15.0" fill="rgb(208,53,5)" rx="2" ry="2" />
+<text  x="72.15" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_logical (2 samples, 0.01%)</title><rect x="39.8" y="165" width="0.1" height="15.0" fill="rgb(211,173,18)" rx="2" ry="2" />
+<text  x="42.78" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_flux_layer (3 samples, 0.02%)</title><rect x="438.3" y="149" width="0.2" height="15.0" fill="rgb(219,210,38)" rx="2" ry="2" />
+<text  x="441.28" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_real (2 samples, 0.01%)</title><rect x="31.6" y="133" width="0.2" height="15.0" fill="rgb(242,2,15)" rx="2" ry="2" />
+<text  x="34.64" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_vertvisc_remnant (445 samples, 2.53%)</title><rect x="981.0" y="165" width="29.9" height="15.0" fill="rgb(244,105,42)" rx="2" ry="2" />
+<text  x="983.97" y="175.5" >__..</text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1152.9" y="213" width="0.3" height="15.0" fill="rgb(206,151,19)" rx="2" ry="2" />
+<text  x="1155.90" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="50.7" y="149" width="0.2" height="15.0" fill="rgb(237,176,44)" rx="2" ry="2" />
+<text  x="53.73" y="159.5" ></text>
+</g>
+<g >
+<title>__vdso_clock_gettime (3 samples, 0.02%)</title><rect x="1154.0" y="245" width="0.2" height="15.0" fill="rgb(213,113,34)" rx="2" ry="2" />
+<text  x="1157.04" y="255.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (6 samples, 0.03%)</title><rect x="128.7" y="117" width="0.4" height="15.0" fill="rgb(216,66,25)" rx="2" ry="2" />
+<text  x="131.70" y="127.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_trylock (2 samples, 0.01%)</title><rect x="1100.7" y="245" width="0.2" height="15.0" fill="rgb(251,2,51)" rx="2" ry="2" />
+<text  x="1103.74" y="255.5" ></text>
+</g>
+<g >
+<title>_gfortrani_internal_pack_r8 (2 samples, 0.01%)</title><rect x="1096.5" y="181" width="0.1" height="15.0" fill="rgb(250,125,1)" rx="2" ry="2" />
+<text  x="1099.51" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1189.5" y="229" width="0.2" height="15.0" fill="rgb(229,160,53)" rx="2" ry="2" />
+<text  x="1192.53" y="239.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (3 samples, 0.02%)</title><rect x="1184.4" y="261" width="0.2" height="15.0" fill="rgb(216,4,36)" rx="2" ry="2" />
+<text  x="1187.42" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1152.9" y="197" width="0.3" height="15.0" fill="rgb(245,170,13)" rx="2" ry="2" />
+<text  x="1155.90" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="32.6" y="133" width="0.1" height="15.0" fill="rgb(232,37,47)" rx="2" ry="2" />
+<text  x="35.58" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_forcing_type_MOD_extractfluxes1d (20 samples, 0.11%)</title><rect x="69.3" y="133" width="1.4" height="15.0" fill="rgb(207,214,52)" rx="2" ry="2" />
+<text  x="72.35" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.0 (18 samples, 0.10%)</title><rect x="91.0" y="117" width="1.2" height="15.0" fill="rgb(236,79,17)" rx="2" ry="2" />
+<text  x="93.99" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1145.0" y="245" width="0.1" height="15.0" fill="rgb(231,202,32)" rx="2" ry="2" />
+<text  x="1147.97" y="255.5" ></text>
+</g>
+<g >
+<title>H5O__alloc (4 samples, 0.02%)</title><rect x="14.8" y="245" width="0.3" height="15.0" fill="rgb(231,141,13)" rx="2" ry="2" />
+<text  x="17.84" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (4 samples, 0.02%)</title><rect x="800.0" y="133" width="0.2" height="15.0" fill="rgb(243,216,50)" rx="2" ry="2" />
+<text  x="802.96" y="143.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (4 samples, 0.02%)</title><rect x="127.6" y="101" width="0.3" height="15.0" fill="rgb(240,73,54)" rx="2" ry="2" />
+<text  x="130.62" y="111.5" ></text>
+</g>
+<g >
+<title>[libpciaccess.so.0.11.1] (10 samples, 0.06%)</title><rect x="1178.1" y="245" width="0.7" height="15.0" fill="rgb(215,70,52)" rx="2" ry="2" />
+<text  x="1181.10" y="255.5" ></text>
+</g>
+<g >
+<title>[mca_pmix_pmix3x.so] (6 samples, 0.03%)</title><rect x="1176.0" y="261" width="0.4" height="15.0" fill="rgb(215,69,45)" rx="2" ry="2" />
+<text  x="1179.02" y="271.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (21 samples, 0.12%)</title><rect x="25.2" y="229" width="1.4" height="15.0" fill="rgb(254,215,16)" rx="2" ry="2" />
+<text  x="28.19" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="32.1" y="165" width="0.1" height="15.0" fill="rgb(216,18,25)" rx="2" ry="2" />
+<text  x="35.11" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (6 samples, 0.03%)</title><rect x="804.3" y="133" width="0.4" height="15.0" fill="rgb(249,166,18)" rx="2" ry="2" />
+<text  x="807.26" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="52.3" y="133" width="0.3" height="15.0" fill="rgb(239,110,2)" rx="2" ry="2" />
+<text  x="55.34" y="143.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (4 samples, 0.02%)</title><rect x="52.3" y="165" width="0.3" height="15.0" fill="rgb(232,153,20)" rx="2" ry="2" />
+<text  x="55.34" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (16 samples, 0.09%)</title><rect x="110.6" y="101" width="1.1" height="15.0" fill="rgb(207,226,29)" rx="2" ry="2" />
+<text  x="113.62" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="97.7" y="85" width="0.1" height="15.0" fill="rgb(206,107,5)" rx="2" ry="2" />
+<text  x="100.71" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="1152.8" y="245" width="0.4" height="15.0" fill="rgb(253,169,24)" rx="2" ry="2" />
+<text  x="1155.76" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_advect_MOD_advect_tracer (262 samples, 1.49%)</title><rect x="1057.7" y="181" width="17.6" height="15.0" fill="rgb(216,207,13)" rx="2" ry="2" />
+<text  x="1060.66" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1057.3" y="101" width="0.2" height="15.0" fill="rgb(235,225,7)" rx="2" ry="2" />
+<text  x="1060.32" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="97.6" y="133" width="0.2" height="15.0" fill="rgb(232,147,15)" rx="2" ry="2" />
+<text  x="100.58" y="143.5" ></text>
+</g>
+<g >
+<title>H5_hash_string (3 samples, 0.02%)</title><rect x="17.9" y="245" width="0.2" height="15.0" fill="rgb(241,222,52)" rx="2" ry="2" />
+<text  x="20.86" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (28 samples, 0.16%)</title><rect x="471.5" y="133" width="1.9" height="15.0" fill="rgb(254,52,8)" rx="2" ry="2" />
+<text  x="474.49" y="143.5" ></text>
+</g>
+<g >
+<title>[mca_pmix_pmix3x.so] (2 samples, 0.01%)</title><rect x="13.2" y="261" width="0.2" height="15.0" fill="rgb(239,66,38)" rx="2" ry="2" />
+<text  x="16.23" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_interface_heights_MOD_find_eta_3d (10 samples, 0.06%)</title><rect x="1018.5" y="165" width="0.7" height="15.0" fill="rgb(251,155,18)" rx="2" ry="2" />
+<text  x="1021.54" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="31.1" y="165" width="0.1" height="15.0" fill="rgb(253,194,39)" rx="2" ry="2" />
+<text  x="34.11" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (6 samples, 0.03%)</title><rect x="1021.4" y="133" width="0.4" height="15.0" fill="rgb(254,186,1)" rx="2" ry="2" />
+<text  x="1024.36" y="143.5" ></text>
+</g>
+<g >
+<title>H5A__close (2 samples, 0.01%)</title><rect x="13.6" y="245" width="0.1" height="15.0" fill="rgb(216,206,36)" rx="2" ry="2" />
+<text  x="16.56" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_document_MOD_doc_param_real (2 samples, 0.01%)</title><rect x="39.6" y="133" width="0.1" height="15.0" fill="rgb(237,49,44)" rx="2" ry="2" />
+<text  x="42.57" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="43.0" y="165" width="0.1" height="15.0" fill="rgb(222,107,1)" rx="2" ry="2" />
+<text  x="46.00" y="175.5" ></text>
+</g>
+<g >
+<title>malloc_consolidate (4 samples, 0.02%)</title><rect x="1171.5" y="261" width="0.3" height="15.0" fill="rgb(215,124,23)" rx="2" ry="2" />
+<text  x="1174.52" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="39.4" y="149" width="0.2" height="15.0" fill="rgb(205,59,6)" rx="2" ry="2" />
+<text  x="42.44" y="159.5" ></text>
+</g>
+<g >
+<title>_IO_getline_info (4 samples, 0.02%)</title><rect x="1183.1" y="261" width="0.2" height="15.0" fill="rgb(216,219,45)" rx="2" ry="2" />
+<text  x="1186.08" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (5 samples, 0.03%)</title><rect x="40.7" y="165" width="0.4" height="15.0" fill="rgb(235,94,0)" rx="2" ry="2" />
+<text  x="43.72" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.03%)</title><rect x="247.1" y="117" width="0.4" height="15.0" fill="rgb(249,108,8)" rx="2" ry="2" />
+<text  x="250.06" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="27.5" y="229" width="0.3" height="15.0" fill="rgb(244,75,54)" rx="2" ry="2" />
+<text  x="30.48" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1185.1" y="117" width="0.1" height="15.0" fill="rgb(232,73,14)" rx="2" ry="2" />
+<text  x="1188.09" y="127.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (4 samples, 0.02%)</title><rect x="1011.0" y="165" width="0.3" height="15.0" fill="rgb(250,141,1)" rx="2" ry="2" />
+<text  x="1014.01" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (3 samples, 0.02%)</title><rect x="69.1" y="133" width="0.2" height="15.0" fill="rgb(250,86,37)" rx="2" ry="2" />
+<text  x="72.15" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1057.3" y="69" width="0.2" height="15.0" fill="rgb(240,164,27)" rx="2" ry="2" />
+<text  x="1060.32" y="79.5" ></text>
+</g>
+<g >
+<title>__mom_interface_heights_MOD_find_eta_3d (2 samples, 0.01%)</title><rect x="1032.1" y="165" width="0.1" height="15.0" fill="rgb(250,196,51)" rx="2" ry="2" />
+<text  x="1035.12" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1128.7" y="245" width="0.3" height="15.0" fill="rgb(218,68,1)" rx="2" ry="2" />
+<text  x="1131.70" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_coms_MOD_increment_ints_faster (8 samples, 0.05%)</title><rect x="30.4" y="165" width="0.5" height="15.0" fill="rgb(221,83,54)" rx="2" ry="2" />
+<text  x="33.37" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_bulk_mixed_layer_MOD_mixedlayer_detrain_2 (7 samples, 0.04%)</title><rect x="67.5" y="133" width="0.5" height="15.0" fill="rgb(246,215,51)" rx="2" ry="2" />
+<text  x="70.53" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_flow_control_MOD_call_tracer_column_fns (18 samples, 0.10%)</title><rect x="129.6" y="149" width="1.2" height="15.0" fill="rgb(240,147,54)" rx="2" ry="2" />
+<text  x="132.57" y="159.5" ></text>
+</g>
+<g >
+<title>__vfprintf_internal (2 samples, 0.01%)</title><rect x="1101.7" y="245" width="0.1" height="15.0" fill="rgb(215,3,50)" rx="2" ry="2" />
+<text  x="1104.68" y="255.5" ></text>
+</g>
+<g >
+<title>[libm-2.32.so] (19 samples, 0.11%)</title><rect x="58.1" y="149" width="1.2" height="15.0" fill="rgb(243,104,6)" rx="2" ry="2" />
+<text  x="61.06" y="159.5" ></text>
+</g>
+<g >
+<title>_dl_lookup_symbol_x (4 samples, 0.02%)</title><rect x="1102.0" y="213" width="0.2" height="15.0" fill="rgb(206,55,34)" rx="2" ry="2" />
+<text  x="1104.95" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (16,502 samples, 94.00%)</title><rect x="13.4" y="261" width="1109.2" height="15.0" fill="rgb(248,211,36)" rx="2" ry="2" />
+<text  x="16.43" y="271.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1057.3" y="37" width="0.2" height="15.0" fill="rgb(214,215,54)" rx="2" ry="2" />
+<text  x="1060.32" y="47.5" ></text>
+</g>
+<g >
+<title>dl_open_worker (7 samples, 0.04%)</title><rect x="1154.2" y="261" width="0.5" height="15.0" fill="rgb(232,50,47)" rx="2" ry="2" />
+<text  x="1157.24" y="271.5" ></text>
+</g>
+<g >
+<title>__mpp_mod_MOD_mpp_transmit_real8 (3 samples, 0.02%)</title><rect x="1100.3" y="245" width="0.2" height="15.0" fill="rgb(250,228,49)" rx="2" ry="2" />
+<text  x="1103.34" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_vertvisc_limit_vel (158 samples, 0.90%)</title><rect x="838.1" y="149" width="10.7" height="15.0" fill="rgb(238,15,51)" rx="2" ry="2" />
+<text  x="841.14" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="50.8" y="101" width="0.1" height="15.0" fill="rgb(233,91,12)" rx="2" ry="2" />
+<text  x="53.80" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_bkgnd_mixing_MOD_sfc_bkgnd_mixing (2 samples, 0.01%)</title><rect x="99.9" y="133" width="0.2" height="15.0" fill="rgb(232,195,10)" rx="2" ry="2" />
+<text  x="102.93" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (34 samples, 0.19%)</title><rect x="1054.1" y="149" width="2.3" height="15.0" fill="rgb(221,175,18)" rx="2" ry="2" />
+<text  x="1057.09" y="159.5" ></text>
+</g>
+<g >
+<title>__mpp_domains_mod_MOD_mpp_do_update_r8_3d.constprop.0 (2 samples, 0.01%)</title><rect x="1099.6" y="245" width="0.1" height="15.0" fill="rgb(240,126,41)" rx="2" ry="2" />
+<text  x="1102.60" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_obsolete_params_MOD_obsolete_logical (3 samples, 0.02%)</title><rect x="40.2" y="165" width="0.2" height="15.0" fill="rgb(207,128,14)" rx="2" ry="2" />
+<text  x="43.25" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1057.3" y="53" width="0.2" height="15.0" fill="rgb(247,12,33)" rx="2" ry="2" />
+<text  x="1060.32" y="63.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.0 (2 samples, 0.01%)</title><rect x="90.9" y="117" width="0.1" height="15.0" fill="rgb(212,36,42)" rx="2" ry="2" />
+<text  x="93.86" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_logical (2 samples, 0.01%)</title><rect x="36.0" y="149" width="0.1" height="15.0" fill="rgb(252,131,32)" rx="2" ry="2" />
+<text  x="39.01" y="159.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (43 samples, 0.24%)</title><rect x="43.9" y="181" width="2.9" height="15.0" fill="rgb(214,80,19)" rx="2" ry="2" />
+<text  x="46.94" y="191.5" ></text>
+</g>
+<g >
+<title>__vfprintf_internal (2 samples, 0.01%)</title><rect x="1181.5" y="245" width="0.2" height="15.0" fill="rgb(215,132,0)" rx="2" ry="2" />
+<text  x="1184.53" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (9 samples, 0.05%)</title><rect x="246.9" y="133" width="0.6" height="15.0" fill="rgb(210,193,32)" rx="2" ry="2" />
+<text  x="249.86" y="143.5" ></text>
+</g>
+<g >
+<title>dl_main (2 samples, 0.01%)</title><rect x="1181.7" y="229" width="0.2" height="15.0" fill="rgb(230,148,53)" rx="2" ry="2" />
+<text  x="1184.73" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1185.1" y="133" width="0.1" height="15.0" fill="rgb(247,222,49)" rx="2" ry="2" />
+<text  x="1188.09" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_diagnostics_MOD_calculate_diagnostic_fields (4 samples, 0.02%)</title><rect x="132.5" y="181" width="0.3" height="15.0" fill="rgb(230,197,9)" rx="2" ry="2" />
+<text  x="135.53" y="191.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_index (2 samples, 0.01%)</title><rect x="32.1" y="133" width="0.1" height="15.0" fill="rgb(223,47,23)" rx="2" ry="2" />
+<text  x="35.11" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_diag_update_remap_grids (18 samples, 0.10%)</title><rect x="131.3" y="181" width="1.2" height="15.0" fill="rgb(239,93,14)" rx="2" ry="2" />
+<text  x="134.32" y="191.5" ></text>
+</g>
+<g >
+<title>__clone (4 samples, 0.02%)</title><rect x="1179.0" y="197" width="0.2" height="15.0" fill="rgb(224,11,6)" rx="2" ry="2" />
+<text  x="1181.98" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_diagnostics_MOD_mom_diagnostics_init (4 samples, 0.02%)</title><rect x="34.8" y="181" width="0.3" height="15.0" fill="rgb(241,57,17)" rx="2" ry="2" />
+<text  x="37.80" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="36.9" y="133" width="0.1" height="15.0" fill="rgb(248,107,35)" rx="2" ry="2" />
+<text  x="39.89" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_continuity_ppm (5,338 samples, 30.41%)</title><rect x="253.6" y="165" width="358.8" height="15.0" fill="rgb(230,51,47)" rx="2" ry="2" />
+<text  x="256.58" y="175.5" >__mom_continuity_ppm_MOD_continuity_ppm</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_real (2 samples, 0.01%)</title><rect x="1097.7" y="165" width="0.2" height="15.0" fill="rgb(246,103,9)" rx="2" ry="2" />
+<text  x="1100.72" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_set_dtbt (41 samples, 0.23%)</title><rect x="250.7" y="165" width="2.7" height="15.0" fill="rgb(251,205,3)" rx="2" ry="2" />
+<text  x="253.69" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="32.1" y="149" width="0.1" height="15.0" fill="rgb(205,173,39)" rx="2" ry="2" />
+<text  x="35.11" y="159.5" ></text>
+</g>
+<g >
+<title>PMPI_Wait (2 samples, 0.01%)</title><rect x="23.2" y="197" width="0.2" height="15.0" fill="rgb(252,137,6)" rx="2" ry="2" />
+<text  x="26.24" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1185.0" y="181" width="0.2" height="15.0" fill="rgb(249,201,36)" rx="2" ry="2" />
+<text  x="1188.03" y="191.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (18 samples, 0.10%)</title><rect x="299.4" y="133" width="1.2" height="15.0" fill="rgb(235,67,26)" rx="2" ry="2" />
+<text  x="302.42" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_hor_diff_MOD_tracer_hor_diff_init (3 samples, 0.02%)</title><rect x="43.1" y="181" width="0.2" height="15.0" fill="rgb(226,85,36)" rx="2" ry="2" />
+<text  x="46.14" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (47 samples, 0.27%)</title><rect x="22.0" y="229" width="3.2" height="15.0" fill="rgb(245,58,27)" rx="2" ry="2" />
+<text  x="25.03" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (3 samples, 0.02%)</title><rect x="31.4" y="149" width="0.2" height="15.0" fill="rgb(232,151,47)" rx="2" ry="2" />
+<text  x="34.44" y="159.5" ></text>
+</g>
+<g >
+<title>__diag_manager_mod_MOD_send_data_3d (82 samples, 0.47%)</title><rect x="1123.1" y="261" width="5.5" height="15.0" fill="rgb(206,50,38)" rx="2" ry="2" />
+<text  x="1126.12" y="271.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_recv_request_progress_rget (4 samples, 0.02%)</title><rect x="24.7" y="213" width="0.2" height="15.0" fill="rgb(253,101,15)" rx="2" ry="2" />
+<text  x="27.65" y="223.5" ></text>
+</g>
+<g >
+<title>__mpp_domains_mod_MOD_mpp_do_group_update_r8 (200 samples, 1.14%)</title><rect x="1129.8" y="261" width="13.5" height="15.0" fill="rgb(229,124,29)" rx="2" ry="2" />
+<text  x="1132.84" y="271.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_recv_req_start (4 samples, 0.02%)</title><rect x="24.2" y="213" width="0.3" height="15.0" fill="rgb(218,49,29)" rx="2" ry="2" />
+<text  x="27.18" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.0 (6 samples, 0.03%)</title><rect x="85.2" y="117" width="0.4" height="15.0" fill="rgb(243,62,29)" rx="2" ry="2" />
+<text  x="88.21" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_kappa_shear_MOD_find_kappa_tke (195 samples, 1.11%)</title><rect x="114.0" y="101" width="13.1" height="15.0" fill="rgb(247,151,20)" rx="2" ry="2" />
+<text  x="116.98" y="111.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (10 samples, 0.06%)</title><rect x="246.8" y="149" width="0.7" height="15.0" fill="rgb(229,128,17)" rx="2" ry="2" />
+<text  x="249.79" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_eos_init (2 samples, 0.01%)</title><rect x="38.0" y="181" width="0.2" height="15.0" fill="rgb(249,119,44)" rx="2" ry="2" />
+<text  x="41.03" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (7 samples, 0.04%)</title><rect x="100.3" y="101" width="0.5" height="15.0" fill="rgb(226,9,27)" rx="2" ry="2" />
+<text  x="103.33" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (2 samples, 0.01%)</title><rect x="804.5" y="101" width="0.2" height="15.0" fill="rgb(246,43,0)" rx="2" ry="2" />
+<text  x="807.53" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_fixed_initialization_MOD_mom_initialize_fixed (7 samples, 0.04%)</title><rect x="38.6" y="181" width="0.4" height="15.0" fill="rgb(207,113,45)" rx="2" ry="2" />
+<text  x="41.57" y="191.5" ></text>
+</g>
+<g >
+<title>unlink_chunk.constprop.0 (4 samples, 0.02%)</title><rect x="1122.2" y="245" width="0.3" height="15.0" fill="rgb(251,178,21)" rx="2" ry="2" />
+<text  x="1125.25" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_coriolisadv_MOD_coradcalc (694 samples, 3.95%)</title><rect x="612.4" y="165" width="46.6" height="15.0" fill="rgb(221,206,14)" rx="2" ry="2" />
+<text  x="615.37" y="175.5" >__mo..</text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_log_available_diag (2 samples, 0.01%)</title><rect x="31.9" y="133" width="0.1" height="15.0" fill="rgb(243,138,50)" rx="2" ry="2" />
+<text  x="34.91" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1189.5" y="245" width="0.2" height="15.0" fill="rgb(234,85,42)" rx="2" ry="2" />
+<text  x="1192.53" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (9 samples, 0.05%)</title><rect x="163.7" y="149" width="0.6" height="15.0" fill="rgb(216,210,1)" rx="2" ry="2" />
+<text  x="166.72" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="247.2" y="85" width="0.3" height="15.0" fill="rgb(229,58,30)" rx="2" ry="2" />
+<text  x="250.20" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_hor_diff_MOD_tracer_hordiff (312 samples, 1.78%)</title><rect x="1075.3" y="181" width="20.9" height="15.0" fill="rgb(223,132,10)" rx="2" ry="2" />
+<text  x="1078.27" y="191.5" ></text>
+</g>
+<g >
+<title>_dl_lookup_symbol_x (6 samples, 0.03%)</title><rect x="1187.1" y="245" width="0.4" height="15.0" fill="rgb(214,17,22)" rx="2" ry="2" />
+<text  x="1190.11" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (6 samples, 0.03%)</title><rect x="1021.4" y="149" width="0.4" height="15.0" fill="rgb(211,170,46)" rx="2" ry="2" />
+<text  x="1024.36" y="159.5" ></text>
+</g>
+<g >
+<title>_int_free (4 samples, 0.02%)</title><rect x="130.8" y="149" width="0.3" height="15.0" fill="rgb(249,81,1)" rx="2" ry="2" />
+<text  x="133.85" y="159.5" ></text>
+</g>
+<g >
+<title>[mca_pml_ob1.so] (3 samples, 0.02%)</title><rect x="1120.6" y="229" width="0.2" height="15.0" fill="rgb(215,49,23)" rx="2" ry="2" />
+<text  x="1123.64" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_set_diffusivity_MOD_set_diffusivity (538 samples, 3.06%)</title><rect x="93.4" y="149" width="36.2" height="15.0" fill="rgb(236,83,47)" rx="2" ry="2" />
+<text  x="96.41" y="159.5" >__m..</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="39.4" y="165" width="0.2" height="15.0" fill="rgb(214,132,37)" rx="2" ry="2" />
+<text  x="42.44" y="175.5" ></text>
+</g>
+<g >
+<title>__mpp_io_mod_MOD_mpp_write_2ddecomp_r3d (3 samples, 0.02%)</title><rect x="1099.8" y="245" width="0.2" height="15.0" fill="rgb(219,174,36)" rx="2" ry="2" />
+<text  x="1102.80" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (18 samples, 0.10%)</title><rect x="245.6" y="149" width="1.2" height="15.0" fill="rgb(246,130,3)" rx="2" ry="2" />
+<text  x="248.58" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (14 samples, 0.08%)</title><rect x="110.8" y="85" width="0.9" height="15.0" fill="rgb(237,164,46)" rx="2" ry="2" />
+<text  x="113.75" y="95.5" ></text>
+</g>
+<g >
+<title>hwloc_linux_set_tid_cpubind (10 samples, 0.06%)</title><rect x="1188.5" y="261" width="0.6" height="15.0" fill="rgb(223,58,3)" rx="2" ry="2" />
+<text  x="1191.45" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_set_local_bt_cont_types (45 samples, 0.26%)</title><rect x="247.5" y="149" width="3.0" height="15.0" fill="rgb(226,186,38)" rx="2" ry="2" />
+<text  x="250.47" y="159.5" ></text>
+</g>
+<g >
+<title>_int_free (8 samples, 0.05%)</title><rect x="127.1" y="101" width="0.5" height="15.0" fill="rgb(236,41,18)" rx="2" ry="2" />
+<text  x="130.09" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1185.1" y="149" width="0.1" height="15.0" fill="rgb(208,94,28)" rx="2" ry="2" />
+<text  x="1188.09" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_MOD_finish_mom_initialization (10 samples, 0.06%)</title><rect x="30.2" y="197" width="0.7" height="15.0" fill="rgb(225,158,18)" rx="2" ry="2" />
+<text  x="33.23" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (88 samples, 0.50%)</title><rect x="804.7" y="133" width="5.9" height="15.0" fill="rgb(245,48,39)" rx="2" ry="2" />
+<text  x="807.67" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_vertvisc_coef (1,967 samples, 11.20%)</title><rect x="848.8" y="165" width="132.2" height="15.0" fill="rgb(241,228,41)" rx="2" ry="2" />
+<text  x="851.76" y="175.5" >__mom_vert_frict..</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (5 samples, 0.03%)</title><rect x="35.5" y="149" width="0.4" height="15.0" fill="rgb(229,225,8)" rx="2" ry="2" />
+<text  x="38.54" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_1d (11 samples, 0.06%)</title><rect x="817.1" y="149" width="0.7" height="15.0" fill="rgb(237,89,6)" rx="2" ry="2" />
+<text  x="820.10" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="1184.8" y="245" width="0.4" height="15.0" fill="rgb(207,78,16)" rx="2" ry="2" />
+<text  x="1187.76" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="52.3" y="117" width="0.3" height="15.0" fill="rgb(239,99,35)" rx="2" ry="2" />
+<text  x="55.34" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_bulk_mixed_layer_MOD_bulkmixedlayer_init (7 samples, 0.04%)</title><rect x="31.4" y="165" width="0.4" height="15.0" fill="rgb(226,82,11)" rx="2" ry="2" />
+<text  x="34.37" y="175.5" ></text>
+</g>
+<g >
+<title>__mpp_mod_MOD_get_peset (3 samples, 0.02%)</title><rect x="1144.3" y="261" width="0.2" height="15.0" fill="rgb(233,204,32)" rx="2" ry="2" />
+<text  x="1147.29" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_btstep (1,163 samples, 6.62%)</title><rect x="172.5" y="165" width="78.2" height="15.0" fill="rgb(226,220,45)" rx="2" ry="2" />
+<text  x="175.52" y="175.5" >__mom_bar..</text>
+</g>
+<g >
+<title>__mom_diabatic_aux_MOD_set_pen_shortwave (7 samples, 0.04%)</title><rect x="77.3" y="149" width="0.5" height="15.0" fill="rgb(226,98,0)" rx="2" ry="2" />
+<text  x="80.28" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="75.9" y="101" width="0.1" height="15.0" fill="rgb(227,23,14)" rx="2" ry="2" />
+<text  x="78.87" y="111.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (11 samples, 0.06%)</title><rect x="1101.9" y="245" width="0.7" height="15.0" fill="rgb(236,74,33)" rx="2" ry="2" />
+<text  x="1104.88" y="255.5" ></text>
+</g>
+<g >
+<title>opal_rand (2 samples, 0.01%)</title><rect x="1172.1" y="261" width="0.2" height="15.0" fill="rgb(218,175,36)" rx="2" ry="2" />
+<text  x="1175.12" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="27.7" y="197" width="0.1" height="15.0" fill="rgb(253,146,22)" rx="2" ry="2" />
+<text  x="30.68" y="207.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_len_trim (2 samples, 0.01%)</title><rect x="35.7" y="117" width="0.2" height="15.0" fill="rgb(210,2,24)" rx="2" ry="2" />
+<text  x="38.74" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_lateral_mixing_coeffs_MOD_calc_resoln_function (61 samples, 0.35%)</title><rect x="1011.8" y="181" width="4.1" height="15.0" fill="rgb(235,201,20)" rx="2" ry="2" />
+<text  x="1014.82" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (3 samples, 0.02%)</title><rect x="39.6" y="165" width="0.2" height="15.0" fill="rgb(226,113,30)" rx="2" ry="2" />
+<text  x="42.57" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (78 samples, 0.44%)</title><rect x="805.3" y="101" width="5.2" height="15.0" fill="rgb(251,70,42)" rx="2" ry="2" />
+<text  x="808.27" y="111.5" ></text>
+</g>
+<g >
+<title>clock_gettime@GLIBC_2.2.5 (11 samples, 0.06%)</title><rect x="1153.5" y="261" width="0.7" height="15.0" fill="rgb(216,201,7)" rx="2" ry="2" />
+<text  x="1156.50" y="271.5" ></text>
+</g>
+<g >
+<title>printf_positional (2 samples, 0.01%)</title><rect x="1101.7" y="229" width="0.1" height="15.0" fill="rgb(231,97,26)" rx="2" ry="2" />
+<text  x="1104.68" y="239.5" ></text>
+</g>
+<g >
+<title>__memchr_avx2 (4 samples, 0.02%)</title><rect x="1184.1" y="261" width="0.3" height="15.0" fill="rgb(210,129,22)" rx="2" ry="2" />
+<text  x="1187.09" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="97.6" y="117" width="0.2" height="15.0" fill="rgb(215,81,15)" rx="2" ry="2" />
+<text  x="100.65" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_flux_layer (691 samples, 3.94%)</title><rect x="565.6" y="133" width="46.4" height="15.0" fill="rgb(220,107,41)" rx="2" ry="2" />
+<text  x="568.59" y="143.5" >__mo..</text>
+</g>
+<g >
+<title>[libhdf5.so.200.0.0] (13 samples, 0.07%)</title><rect x="18.5" y="245" width="0.8" height="15.0" fill="rgb(210,68,53)" rx="2" ry="2" />
+<text  x="21.47" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_ppm_limit_pos (258 samples, 1.47%)</title><rect x="489.5" y="117" width="17.3" height="15.0" fill="rgb(214,217,17)" rx="2" ry="2" />
+<text  x="492.50" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="27.7" y="213" width="0.1" height="15.0" fill="rgb(251,24,1)" rx="2" ry="2" />
+<text  x="30.68" y="223.5" ></text>
+</g>
+<g >
+<title>[libm-2.32.so] (36 samples, 0.21%)</title><rect x="155.9" y="165" width="2.4" height="15.0" fill="rgb(225,11,35)" rx="2" ry="2" />
+<text  x="158.85" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_continuity_ppm (4 samples, 0.02%)</title><rect x="36.1" y="165" width="0.3" height="15.0" fill="rgb(237,28,27)" rx="2" ry="2" />
+<text  x="39.15" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="1097.9" y="149" width="0.1" height="15.0" fill="rgb(211,108,42)" rx="2" ry="2" />
+<text  x="1100.85" y="159.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.01%)</title><rect x="1189.1" y="261" width="0.2" height="15.0" fill="rgb(214,149,21)" rx="2" ry="2" />
+<text  x="1192.13" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_int (2 samples, 0.01%)</title><rect x="35.1" y="165" width="0.2" height="15.0" fill="rgb(237,88,33)" rx="2" ry="2" />
+<text  x="38.14" y="175.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_len_trim (3 samples, 0.02%)</title><rect x="1103.0" y="245" width="0.2" height="15.0" fill="rgb(209,181,15)" rx="2" ry="2" />
+<text  x="1105.96" y="255.5" ></text>
+</g>
+<g >
+<title>do_lookup_x (11 samples, 0.06%)</title><rect x="1187.6" y="261" width="0.8" height="15.0" fill="rgb(238,168,35)" rx="2" ry="2" />
+<text  x="1190.65" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.07%)</title><rect x="722.9" y="117" width="0.8" height="15.0" fill="rgb(206,141,44)" rx="2" ry="2" />
+<text  x="725.93" y="127.5" ></text>
+</g>
+<g >
+<title>epoll_wait (4 samples, 0.02%)</title><rect x="19.9" y="213" width="0.3" height="15.0" fill="rgb(252,213,49)" rx="2" ry="2" />
+<text  x="22.95" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_diag_update_remap_grids (2 samples, 0.01%)</title><rect x="33.9" y="181" width="0.2" height="15.0" fill="rgb(246,171,0)" rx="2" ry="2" />
+<text  x="36.93" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (2 samples, 0.01%)</title><rect x="1025.8" y="133" width="0.1" height="15.0" fill="rgb(236,25,0)" rx="2" ry="2" />
+<text  x="1028.80" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_set_visc_MOD_set_viscous_bbl (67 samples, 0.38%)</title><rect x="1021.8" y="181" width="4.5" height="15.0" fill="rgb(224,92,25)" rx="2" ry="2" />
+<text  x="1024.83" y="191.5" ></text>
+</g>
+<g >
+<title>_gfortrani_next_format (4 samples, 0.02%)</title><rect x="1103.6" y="245" width="0.3" height="15.0" fill="rgb(249,106,38)" rx="2" ry="2" />
+<text  x="1106.63" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_get_input_MOD_get_mom_input (5 samples, 0.03%)</title><rect x="39.0" y="181" width="0.4" height="15.0" fill="rgb(231,174,45)" rx="2" ry="2" />
+<text  x="42.04" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (38 samples, 0.22%)</title><rect x="243.0" y="149" width="2.6" height="15.0" fill="rgb(223,28,50)" rx="2" ry="2" />
+<text  x="246.03" y="159.5" ></text>
+</g>
+<g >
+<title>H5_hash_string (2 samples, 0.01%)</title><rect x="21.0" y="229" width="0.1" height="15.0" fill="rgb(248,86,31)" rx="2" ry="2" />
+<text  x="23.96" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1053.8" y="133" width="0.3" height="15.0" fill="rgb(245,126,1)" rx="2" ry="2" />
+<text  x="1056.76" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (2 samples, 0.01%)</title><rect x="43.0" y="149" width="0.1" height="15.0" fill="rgb(216,26,23)" rx="2" ry="2" />
+<text  x="46.00" y="159.5" ></text>
+</g>
+<g >
+<title>[mca_btl_self.so] (4 samples, 0.02%)</title><rect x="13.0" y="261" width="0.2" height="15.0" fill="rgb(243,171,27)" rx="2" ry="2" />
+<text  x="15.96" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_surface_forcing_MOD_surface_forcing_init (6 samples, 0.03%)</title><rect x="1097.6" y="197" width="0.4" height="15.0" fill="rgb(251,87,27)" rx="2" ry="2" />
+<text  x="1100.58" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_mass_flux (2 samples, 0.01%)</title><rect x="36.3" y="149" width="0.1" height="15.0" fill="rgb(213,127,43)" rx="2" ry="2" />
+<text  x="39.28" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (4 samples, 0.02%)</title><rect x="800.0" y="117" width="0.2" height="15.0" fill="rgb(231,48,38)" rx="2" ry="2" />
+<text  x="802.96" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (15 samples, 0.09%)</title><rect x="68.1" y="117" width="1.0" height="15.0" fill="rgb(208,21,26)" rx="2" ry="2" />
+<text  x="71.14" y="127.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned (5 samples, 0.03%)</title><rect x="46.8" y="181" width="0.4" height="15.0" fill="rgb(217,83,11)" rx="2" ry="2" />
+<text  x="49.83" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.05%)</title><rect x="245.0" y="85" width="0.6" height="15.0" fill="rgb(246,226,20)" rx="2" ry="2" />
+<text  x="248.05" y="95.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (9 samples, 0.05%)</title><rect x="1186.4" y="261" width="0.6" height="15.0" fill="rgb(253,122,12)" rx="2" ry="2" />
+<text  x="1189.44" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_MOD_step_mom_thermo (1,178 samples, 6.71%)</title><rect x="52.1" y="181" width="79.2" height="15.0" fill="rgb(239,57,13)" rx="2" ry="2" />
+<text  x="55.08" y="191.5" >__mom_MOD..</text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="489.0" y="69" width="0.5" height="15.0" fill="rgb(234,159,26)" rx="2" ry="2" />
+<text  x="492.03" y="79.5" ></text>
+</g>
+<g >
+<title>__mpp_mod_MOD_mpp_chksum_i8_1d (2 samples, 0.01%)</title><rect x="1144.5" y="261" width="0.1" height="15.0" fill="rgb(229,31,20)" rx="2" ry="2" />
+<text  x="1147.50" y="271.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (2 samples, 0.01%)</title><rect x="438.1" y="133" width="0.1" height="15.0" fill="rgb(222,12,28)" rx="2" ry="2" />
+<text  x="441.08" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (29 samples, 0.17%)</title><rect x="1054.4" y="133" width="2.0" height="15.0" fill="rgb(223,157,49)" rx="2" ry="2" />
+<text  x="1057.43" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.07%)</title><rect x="244.7" y="133" width="0.9" height="15.0" fill="rgb(245,220,41)" rx="2" ry="2" />
+<text  x="247.71" y="143.5" ></text>
+</g>
+<g >
+<title>[mca_btl_self.so] (2 samples, 0.01%)</title><rect x="1120.5" y="229" width="0.1" height="15.0" fill="rgb(236,194,35)" rx="2" ry="2" />
+<text  x="1123.50" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="164.2" y="117" width="0.1" height="15.0" fill="rgb(231,160,25)" rx="2" ry="2" />
+<text  x="167.19" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="27.7" y="165" width="0.1" height="15.0" fill="rgb(228,12,25)" rx="2" ry="2" />
+<text  x="30.68" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="489.4" y="37" width="0.1" height="15.0" fill="rgb(237,215,3)" rx="2" ry="2" />
+<text  x="492.37" y="47.5" ></text>
+</g>
+<g >
+<title>[libopen-pal.so.40.20.5] (2 samples, 0.01%)</title><rect x="19.7" y="213" width="0.2" height="15.0" fill="rgb(207,186,54)" rx="2" ry="2" />
+<text  x="22.75" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1183.5" y="245" width="0.2" height="15.0" fill="rgb(234,111,34)" rx="2" ry="2" />
+<text  x="1186.48" y="255.5" ></text>
+</g>
+<g >
+<title>__nptl_set_robust (2 samples, 0.01%)</title><rect x="1145.0" y="261" width="0.1" height="15.0" fill="rgb(212,221,44)" rx="2" ry="2" />
+<text  x="1147.97" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_analytic_int_density_dz (1,133 samples, 6.45%)</title><rect x="723.8" y="149" width="76.2" height="15.0" fill="rgb(223,75,54)" rx="2" ry="2" />
+<text  x="726.81" y="159.5" >__mom_eo..</text>
+</g>
+<g >
+<title>__strcmp_avx2 (2 samples, 0.01%)</title><rect x="1180.9" y="245" width="0.2" height="15.0" fill="rgb(244,164,12)" rx="2" ry="2" />
+<text  x="1183.93" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_face_thickness (133 samples, 0.76%)</title><rect x="506.8" y="133" width="9.0" height="15.0" fill="rgb(242,121,47)" rx="2" ry="2" />
+<text  x="509.84" y="143.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_len_trim (2 samples, 0.01%)</title><rect x="33.5" y="101" width="0.1" height="15.0" fill="rgb(225,58,38)" rx="2" ry="2" />
+<text  x="36.46" y="111.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (14 samples, 0.08%)</title><rect x="1031.1" y="165" width="0.9" height="15.0" fill="rgb(235,175,25)" rx="2" ry="2" />
+<text  x="1034.11" y="175.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (4 samples, 0.02%)</title><rect x="60.1" y="149" width="0.3" height="15.0" fill="rgb(222,88,48)" rx="2" ry="2" />
+<text  x="63.14" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1054.0" y="85" width="0.1" height="15.0" fill="rgb(209,149,2)" rx="2" ry="2" />
+<text  x="1056.96" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="1097.7" y="181" width="0.2" height="15.0" fill="rgb(224,144,39)" rx="2" ry="2" />
+<text  x="1100.72" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.1 (48 samples, 0.27%)</title><rect x="87.6" y="117" width="3.2" height="15.0" fill="rgb(207,20,3)" rx="2" ry="2" />
+<text  x="90.56" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (10 samples, 0.06%)</title><rect x="59.5" y="149" width="0.6" height="15.0" fill="rgb(252,141,44)" rx="2" ry="2" />
+<text  x="62.47" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_grid_initialize_MOD_set_grid_metrics (3 samples, 0.02%)</title><rect x="38.7" y="165" width="0.2" height="15.0" fill="rgb(221,11,34)" rx="2" ry="2" />
+<text  x="41.70" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_restart_MOD_restart_init (3 samples, 0.02%)</title><rect x="40.5" y="181" width="0.2" height="15.0" fill="rgb(233,213,43)" rx="2" ry="2" />
+<text  x="43.51" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="489.4" y="53" width="0.1" height="15.0" fill="rgb(208,88,26)" rx="2" ry="2" />
+<text  x="492.37" y="63.5" ></text>
+</g>
+<g >
+<title>[libhwloc.so.15.2.0] (13 samples, 0.07%)</title><rect x="1175.1" y="261" width="0.9" height="15.0" fill="rgb(221,190,24)" rx="2" ry="2" />
+<text  x="1178.08" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_thickness_diffuse_MOD_thickness_diffuse_full.constprop.0 (375 samples, 2.14%)</title><rect x="1032.2" y="165" width="25.3" height="15.0" fill="rgb(238,57,18)" rx="2" ry="2" />
+<text  x="1035.25" y="175.5" >_..</text>
+</g>
+<g >
+<title>__mom_document_MOD_doc_param_real (2 samples, 0.01%)</title><rect x="1097.7" y="149" width="0.2" height="15.0" fill="rgb(238,93,48)" rx="2" ry="2" />
+<text  x="1100.72" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (11 samples, 0.06%)</title><rect x="100.1" y="133" width="0.7" height="15.0" fill="rgb(216,65,47)" rx="2" ry="2" />
+<text  x="103.07" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_int (2 samples, 0.01%)</title><rect x="35.1" y="149" width="0.2" height="15.0" fill="rgb(205,201,13)" rx="2" ry="2" />
+<text  x="38.14" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_interface_heights_MOD_find_eta_3d (4 samples, 0.02%)</title><rect x="132.5" y="165" width="0.3" height="15.0" fill="rgb(205,108,23)" rx="2" ry="2" />
+<text  x="135.53" y="175.5" ></text>
+</g>
+<g >
+<title>H5SL_remove (4 samples, 0.02%)</title><rect x="11.0" y="261" width="0.3" height="15.0" fill="rgb(206,16,34)" rx="2" ry="2" />
+<text  x="14.01" y="271.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (4 samples, 0.02%)</title><rect x="26.6" y="229" width="0.3" height="15.0" fill="rgb(232,166,0)" rx="2" ry="2" />
+<text  x="29.60" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_coms_MOD_increment_ints_faster (9 samples, 0.05%)</title><rect x="1026.5" y="165" width="0.6" height="15.0" fill="rgb(240,191,35)" rx="2" ry="2" />
+<text  x="1029.47" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_bkgnd_mixing_MOD_bkgnd_mixing_init (2 samples, 0.01%)</title><rect x="32.6" y="149" width="0.1" height="15.0" fill="rgb(222,0,38)" rx="2" ry="2" />
+<text  x="35.58" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_set_masks_for_axes (11 samples, 0.06%)</title><rect x="34.1" y="181" width="0.7" height="15.0" fill="rgb(230,131,13)" rx="2" ry="2" />
+<text  x="37.06" y="191.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (3 samples, 0.02%)</title><rect x="1129.1" y="261" width="0.2" height="15.0" fill="rgb(248,65,31)" rx="2" ry="2" />
+<text  x="1132.10" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_diabatic_aux_MOD_make_frazil (19 samples, 0.11%)</title><rect x="76.0" y="149" width="1.3" height="15.0" fill="rgb(227,201,35)" rx="2" ry="2" />
+<text  x="79.00" y="159.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (4 samples, 0.02%)</title><rect x="1098.5" y="245" width="0.3" height="15.0" fill="rgb(226,60,26)" rx="2" ry="2" />
+<text  x="1101.52" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (11 samples, 0.06%)</title><rect x="92.2" y="133" width="0.7" height="15.0" fill="rgb(235,202,21)" rx="2" ry="2" />
+<text  x="95.20" y="143.5" ></text>
+</g>
+<g >
+<title>__strchr_avx2 (3 samples, 0.02%)</title><rect x="1180.7" y="245" width="0.2" height="15.0" fill="rgb(217,185,24)" rx="2" ry="2" />
+<text  x="1183.72" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_MOD_initialize_mom (190 samples, 1.08%)</title><rect x="30.9" y="197" width="12.8" height="15.0" fill="rgb(248,59,23)" rx="2" ry="2" />
+<text  x="33.90" y="207.5" ></text>
+</g>
+<g >
+<title>__close (3 samples, 0.02%)</title><rect x="1183.5" y="261" width="0.2" height="15.0" fill="rgb(221,145,51)" rx="2" ry="2" />
+<text  x="1186.48" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="52.3" y="149" width="0.3" height="15.0" fill="rgb(225,17,29)" rx="2" ry="2" />
+<text  x="55.34" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.06%)</title><rect x="488.8" y="101" width="0.7" height="15.0" fill="rgb(213,71,48)" rx="2" ry="2" />
+<text  x="491.83" y="111.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_index (2 samples, 0.01%)</title><rect x="1097.6" y="149" width="0.1" height="15.0" fill="rgb(233,2,6)" rx="2" ry="2" />
+<text  x="1100.58" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1031.8" y="117" width="0.2" height="15.0" fill="rgb(239,59,50)" rx="2" ry="2" />
+<text  x="1034.78" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_forcing_type_MOD_set_derived_forcing_fields (2 samples, 0.01%)</title><rect x="1097.3" y="181" width="0.1" height="15.0" fill="rgb(215,139,2)" rx="2" ry="2" />
+<text  x="1100.31" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (4 samples, 0.02%)</title><rect x="129.3" y="101" width="0.3" height="15.0" fill="rgb(209,220,45)" rx="2" ry="2" />
+<text  x="132.30" y="111.5" ></text>
+</g>
+<g >
+<title>_dl_start (2 samples, 0.01%)</title><rect x="1146.0" y="261" width="0.1" height="15.0" fill="rgb(227,196,8)" rx="2" ry="2" />
+<text  x="1148.98" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1145.6" y="229" width="0.2" height="15.0" fill="rgb(211,165,52)" rx="2" ry="2" />
+<text  x="1148.64" y="239.5" ></text>
+</g>
+<g >
+<title>__memcmp_avx2_movbe (5 samples, 0.03%)</title><rect x="1098.2" y="245" width="0.3" height="15.0" fill="rgb(254,60,25)" rx="2" ry="2" />
+<text  x="1101.19" y="255.5" ></text>
+</g>
+<g >
+<title>H5O_msg_exists_oh (2 samples, 0.01%)</title><rect x="15.2" y="245" width="0.2" height="15.0" fill="rgb(221,217,15)" rx="2" ry="2" />
+<text  x="18.24" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1031.9" y="85" width="0.1" height="15.0" fill="rgb(207,26,37)" rx="2" ry="2" />
+<text  x="1034.91" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_surface_forcing_MOD_set_forcing (9 samples, 0.05%)</title><rect x="1097.0" y="197" width="0.6" height="15.0" fill="rgb(236,20,12)" rx="2" ry="2" />
+<text  x="1099.98" y="207.5" ></text>
+</g>
+<g >
+<title>[mca_pml_ob1.so] (4 samples, 0.02%)</title><rect x="22.5" y="213" width="0.3" height="15.0" fill="rgb(254,125,27)" rx="2" ry="2" />
+<text  x="25.50" y="223.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_del_procs (6 samples, 0.03%)</title><rect x="1120.5" y="245" width="0.4" height="15.0" fill="rgb(227,70,46)" rx="2" ry="2" />
+<text  x="1123.50" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_document_MOD_doc_param_real (2 samples, 0.01%)</title><rect x="31.6" y="117" width="0.2" height="15.0" fill="rgb(215,172,45)" rx="2" ry="2" />
+<text  x="34.64" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_int_density_dz_wright (1,133 samples, 6.45%)</title><rect x="723.8" y="133" width="76.2" height="15.0" fill="rgb(250,22,3)" rx="2" ry="2" />
+<text  x="726.81" y="143.5" >__mom_eo..</text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (45 samples, 0.26%)</title><rect x="916.6" y="149" width="3.1" height="15.0" fill="rgb(249,118,6)" rx="2" ry="2" />
+<text  x="919.64" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_log_param_logical (3 samples, 0.02%)</title><rect x="33.4" y="133" width="0.2" height="15.0" fill="rgb(211,193,54)" rx="2" ry="2" />
+<text  x="36.39" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_open_param_file (3 samples, 0.02%)</title><rect x="39.0" y="165" width="0.2" height="15.0" fill="rgb(249,31,22)" rx="2" ry="2" />
+<text  x="42.04" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_set_visc_MOD_set_viscous_ml (108 samples, 0.62%)</title><rect x="810.6" y="165" width="7.2" height="15.0" fill="rgb(211,204,29)" rx="2" ry="2" />
+<text  x="813.58" y="175.5" ></text>
+</g>
+<g >
+<title>start_thread (3 samples, 0.02%)</title><rect x="1172.3" y="261" width="0.2" height="15.0" fill="rgb(212,138,50)" rx="2" ry="2" />
+<text  x="1175.26" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_document_MOD_doc_param_logical (3 samples, 0.02%)</title><rect x="33.4" y="117" width="0.2" height="15.0" fill="rgb(222,219,20)" rx="2" ry="2" />
+<text  x="36.39" y="127.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (15,900 samples, 90.57%)</title><rect x="29.5" y="245" width="1068.7" height="15.0" fill="rgb(207,48,12)" rx="2" ry="2" />
+<text  x="32.49" y="255.5" >__libc_start_main</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="42.3" y="165" width="0.1" height="15.0" fill="rgb(229,93,10)" rx="2" ry="2" />
+<text  x="45.26" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_kappa_shear_MOD_calculate_projected_state (34 samples, 0.19%)</title><rect x="111.7" y="101" width="2.3" height="15.0" fill="rgb(221,161,45)" rx="2" ry="2" />
+<text  x="114.69" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1173.0" y="245" width="0.2" height="15.0" fill="rgb(221,117,1)" rx="2" ry="2" />
+<text  x="1175.99" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (106 samples, 0.60%)</title><rect x="259.1" y="149" width="7.1" height="15.0" fill="rgb(250,63,30)" rx="2" ry="2" />
+<text  x="262.09" y="159.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (32 samples, 0.18%)</title><rect x="300.7" y="133" width="2.1" height="15.0" fill="rgb(236,192,15)" rx="2" ry="2" />
+<text  x="303.70" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="31.0" y="149" width="0.1" height="15.0" fill="rgb(224,72,50)" rx="2" ry="2" />
+<text  x="33.97" y="159.5" ></text>
+</g>
+<g >
+<title>main (15,900 samples, 90.57%)</title><rect x="29.5" y="229" width="1068.7" height="15.0" fill="rgb(217,10,8)" rx="2" ry="2" />
+<text  x="32.49" y="239.5" >main</text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (11 samples, 0.06%)</title><rect x="1021.0" y="165" width="0.8" height="15.0" fill="rgb(237,174,34)" rx="2" ry="2" />
+<text  x="1024.03" y="175.5" ></text>
+</g>
+<g >
+<title>opal_pointer_array_add (2 samples, 0.01%)</title><rect x="1121.6" y="245" width="0.1" height="15.0" fill="rgb(233,67,46)" rx="2" ry="2" />
+<text  x="1124.58" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1031.7" y="133" width="0.3" height="15.0" fill="rgb(234,228,38)" rx="2" ry="2" />
+<text  x="1034.71" y="143.5" ></text>
+</g>
+<g >
+<title>__GI___libc_open (4 samples, 0.02%)</title><rect x="27.2" y="245" width="0.3" height="15.0" fill="rgb(252,212,36)" rx="2" ry="2" />
+<text  x="30.21" y="255.5" ></text>
+</g>
+<g >
+<title>__libc_calloc (2 samples, 0.01%)</title><rect x="29.4" y="245" width="0.1" height="15.0" fill="rgb(254,67,14)" rx="2" ry="2" />
+<text  x="32.36" y="255.5" ></text>
+</g>
+<g >
+<title>_gfortrani_data_transfer_init_worker (2 samples, 0.01%)</title><rect x="1103.2" y="245" width="0.1" height="15.0" fill="rgb(220,64,18)" rx="2" ry="2" />
+<text  x="1106.16" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1053.8" y="117" width="0.3" height="15.0" fill="rgb(216,68,52)" rx="2" ry="2" />
+<text  x="1056.76" y="127.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (2 samples, 0.01%)</title><rect x="1181.7" y="245" width="0.2" height="15.0" fill="rgb(254,196,6)" rx="2" ry="2" />
+<text  x="1184.73" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.08%)</title><rect x="722.8" y="133" width="0.9" height="15.0" fill="rgb(207,137,38)" rx="2" ry="2" />
+<text  x="725.80" y="143.5" ></text>
+</g>
+<g >
+<title>orted (222 samples, 1.26%)</title><rect x="1175.1" y="277" width="14.9" height="15.0" fill="rgb(211,34,32)" rx="2" ry="2" />
+<text  x="1178.08" y="287.5" ></text>
+</g>
+<g >
+<title>_int_free (202 samples, 1.15%)</title><rect x="1104.3" y="245" width="13.6" height="15.0" fill="rgb(241,63,26)" rx="2" ry="2" />
+<text  x="1107.30" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="26.7" y="181" width="0.2" height="15.0" fill="rgb(249,42,13)" rx="2" ry="2" />
+<text  x="29.67" y="191.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_index (3 samples, 0.02%)</title><rect x="35.5" y="117" width="0.2" height="15.0" fill="rgb(205,135,2)" rx="2" ry="2" />
+<text  x="38.54" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_dskb.constprop.0 (5 samples, 0.03%)</title><rect x="84.3" y="133" width="0.4" height="15.0" fill="rgb(209,49,16)" rx="2" ry="2" />
+<text  x="87.34" y="143.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (3 samples, 0.02%)</title><rect x="1058.9" y="165" width="0.2" height="15.0" fill="rgb(209,156,46)" rx="2" ry="2" />
+<text  x="1061.87" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_bt_mass_source (19 samples, 0.11%)</title><rect x="164.3" y="165" width="1.3" height="15.0" fill="rgb(238,138,31)" rx="2" ry="2" />
+<text  x="167.32" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_kappa_shear_MOD_kappa_shear_init (7 samples, 0.04%)</title><rect x="33.1" y="149" width="0.5" height="15.0" fill="rgb(210,117,2)" rx="2" ry="2" />
+<text  x="36.12" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_document_MOD_doc_param_logical (2 samples, 0.01%)</title><rect x="39.8" y="149" width="0.1" height="15.0" fill="rgb(243,109,20)" rx="2" ry="2" />
+<text  x="42.78" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="50.6" y="165" width="0.3" height="15.0" fill="rgb(244,66,44)" rx="2" ry="2" />
+<text  x="53.60" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_array_wright (13 samples, 0.07%)</title><rect x="68.3" y="101" width="0.8" height="15.0" fill="rgb(210,65,30)" rx="2" ry="2" />
+<text  x="71.27" y="111.5" ></text>
+</g>
+<g >
+<title>__clone (2 samples, 0.01%)</title><rect x="1179.9" y="245" width="0.2" height="15.0" fill="rgb(206,219,12)" rx="2" ry="2" />
+<text  x="1182.92" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_vertvisc (460 samples, 2.62%)</title><rect x="817.8" y="165" width="31.0" height="15.0" fill="rgb(252,99,11)" rx="2" ry="2" />
+<text  x="820.84" y="175.5" >__..</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="33.3" y="133" width="0.1" height="15.0" fill="rgb(215,92,1)" rx="2" ry="2" />
+<text  x="36.26" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (4 samples, 0.02%)</title><rect x="800.0" y="149" width="0.2" height="15.0" fill="rgb(215,185,45)" rx="2" ry="2" />
+<text  x="802.96" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.07%)</title><rect x="244.8" y="117" width="0.8" height="15.0" fill="rgb(225,183,49)" rx="2" ry="2" />
+<text  x="247.78" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (2 samples, 0.01%)</title><rect x="32.9" y="149" width="0.2" height="15.0" fill="rgb(248,205,9)" rx="2" ry="2" />
+<text  x="35.92" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="163.9" y="133" width="0.4" height="15.0" fill="rgb(211,91,26)" rx="2" ry="2" />
+<text  x="166.85" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="723.5" y="85" width="0.2" height="15.0" fill="rgb(240,132,35)" rx="2" ry="2" />
+<text  x="726.47" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_bulk_mixed_layer_MOD_convective_adjustment (20 samples, 0.11%)</title><rect x="66.2" y="133" width="1.3" height="15.0" fill="rgb(234,100,33)" rx="2" ry="2" />
+<text  x="69.19" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_real (3 samples, 0.02%)</title><rect x="37.0" y="149" width="0.2" height="15.0" fill="rgb(245,55,24)" rx="2" ry="2" />
+<text  x="40.02" y="159.5" ></text>
+</g>
+<g >
+<title>_dl_start_user (5 samples, 0.03%)</title><rect x="1146.1" y="261" width="0.3" height="15.0" fill="rgb(240,0,3)" rx="2" ry="2" />
+<text  x="1149.11" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_pressureforce_mont_MOD_set_pbce_bouss (154 samples, 0.88%)</title><rect x="800.2" y="149" width="10.4" height="15.0" fill="rgb(210,72,41)" rx="2" ry="2" />
+<text  x="803.23" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_advect_MOD_advect_x.constprop.0 (106 samples, 0.60%)</title><rect x="1059.6" y="165" width="7.1" height="15.0" fill="rgb(247,10,32)" rx="2" ry="2" />
+<text  x="1062.61" y="175.5" ></text>
+</g>
+<g >
+<title>_gfortran_concat_string (3 samples, 0.02%)</title><rect x="1146.4" y="261" width="0.2" height="15.0" fill="rgb(244,103,42)" rx="2" ry="2" />
+<text  x="1149.45" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (3 samples, 0.02%)</title><rect x="1015.6" y="117" width="0.2" height="15.0" fill="rgb(247,29,51)" rx="2" ry="2" />
+<text  x="1018.65" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1031.8" y="101" width="0.2" height="15.0" fill="rgb(249,28,29)" rx="2" ry="2" />
+<text  x="1034.78" y="111.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (5 samples, 0.03%)</title><rect x="980.4" y="149" width="0.4" height="15.0" fill="rgb(226,166,9)" rx="2" ry="2" />
+<text  x="983.43" y="159.5" ></text>
+</g>
+<g >
+<title>__sched_cpufree (6 samples, 0.03%)</title><rect x="1185.4" y="261" width="0.4" height="15.0" fill="rgb(246,138,29)" rx="2" ry="2" />
+<text  x="1188.36" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="723.6" y="69" width="0.1" height="15.0" fill="rgb(249,16,18)" rx="2" ry="2" />
+<text  x="726.61" y="79.5" ></text>
+</g>
+<g >
+<title>__mom_MOD_step_mom (15,667 samples, 89.24%)</title><rect x="43.7" y="197" width="1053.0" height="15.0" fill="rgb(254,57,12)" rx="2" ry="2" />
+<text  x="46.67" y="207.5" >__mom_MOD_step_mom</text>
+</g>
+<g >
+<title>__ctype_init (4 samples, 0.02%)</title><rect x="1183.7" y="261" width="0.3" height="15.0" fill="rgb(218,67,43)" rx="2" ry="2" />
+<text  x="1186.68" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_flux_layer (495 samples, 2.82%)</title><rect x="532.3" y="117" width="33.3" height="15.0" fill="rgb(210,46,2)" rx="2" ry="2" />
+<text  x="535.32" y="127.5" >__..</text>
+</g>
+<g >
+<title>[unknown] (19 samples, 0.11%)</title><rect x="488.2" y="117" width="1.3" height="15.0" fill="rgb(254,100,23)" rx="2" ry="2" />
+<text  x="491.22" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.07%)</title><rect x="1031.2" y="149" width="0.8" height="15.0" fill="rgb(221,162,14)" rx="2" ry="2" />
+<text  x="1034.17" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_bkgnd_mixing_MOD_calculate_bkgnd_mixing (22 samples, 0.13%)</title><rect x="98.5" y="133" width="1.4" height="15.0" fill="rgb(209,168,52)" rx="2" ry="2" />
+<text  x="101.45" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_barotropic_init (12 samples, 0.07%)</title><rect x="35.3" y="165" width="0.8" height="15.0" fill="rgb(235,103,51)" rx="2" ry="2" />
+<text  x="38.34" y="175.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (7 samples, 0.04%)</title><rect x="1059.1" y="165" width="0.5" height="15.0" fill="rgb(236,103,48)" rx="2" ry="2" />
+<text  x="1062.14" y="175.5" ></text>
+</g>
+<g >
+<title>next_char_internal (2 samples, 0.01%)</title><rect x="1121.2" y="245" width="0.1" height="15.0" fill="rgb(226,93,9)" rx="2" ry="2" />
+<text  x="1124.17" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_array (3 samples, 0.02%)</title><rect x="1025.7" y="149" width="0.2" height="15.0" fill="rgb(224,52,10)" rx="2" ry="2" />
+<text  x="1028.73" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_register_diag_field (2 samples, 0.01%)</title><rect x="43.3" y="165" width="0.2" height="15.0" fill="rgb(244,25,2)" rx="2" ry="2" />
+<text  x="46.34" y="175.5" ></text>
+</g>
+<g >
+<title>_gfortrani_read_block_form (2 samples, 0.01%)</title><rect x="1104.2" y="245" width="0.1" height="15.0" fill="rgb(231,31,30)" rx="2" ry="2" />
+<text  x="1107.17" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_hor_visc_MOD_horizontal_viscosity (8 samples, 0.05%)</title><rect x="37.3" y="165" width="0.5" height="15.0" fill="rgb(242,181,46)" rx="2" ry="2" />
+<text  x="40.29" y="175.5" ></text>
+</g>
+<g >
+<title>__diag_manager_mod_MOD_send_data_3d (18 samples, 0.10%)</title><rect x="28.0" y="245" width="1.2" height="15.0" fill="rgb(236,176,23)" rx="2" ry="2" />
+<text  x="31.01" y="255.5" ></text>
+</g>
+<g >
+<title>_dl_map_object_deps (3 samples, 0.02%)</title><rect x="1154.4" y="245" width="0.2" height="15.0" fill="rgb(206,108,18)" rx="2" ry="2" />
+<text  x="1157.38" y="255.5" ></text>
+</g>
+<g >
+<title>H5C_unprotect (2 samples, 0.01%)</title><rect x="14.2" y="245" width="0.1" height="15.0" fill="rgb(213,210,25)" rx="2" ry="2" />
+<text  x="17.17" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (3 samples, 0.02%)</title><rect x="40.2" y="149" width="0.2" height="15.0" fill="rgb(232,145,30)" rx="2" ry="2" />
+<text  x="43.25" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_zonal_mass_flux (2,584 samples, 14.72%)</title><rect x="438.5" y="149" width="173.7" height="15.0" fill="rgb(252,117,22)" rx="2" ry="2" />
+<text  x="441.49" y="159.5" >__mom_continuity_ppm_M..</text>
+</g>
+<g >
+<title>__mom_dynamics_split_rk2_MOD_initialize_dyn_split_rk2 (40 samples, 0.23%)</title><rect x="35.3" y="181" width="2.7" height="15.0" fill="rgb(227,37,0)" rx="2" ry="2" />
+<text  x="38.34" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (3 samples, 0.02%)</title><rect x="38.2" y="181" width="0.2" height="15.0" fill="rgb(217,1,6)" rx="2" ry="2" />
+<text  x="41.23" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_diag_mediator_init (2 samples, 0.01%)</title><rect x="33.8" y="181" width="0.1" height="15.0" fill="rgb(232,44,44)" rx="2" ry="2" />
+<text  x="36.79" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_find_coupling_coef (903 samples, 5.14%)</title><rect x="919.7" y="149" width="60.7" height="15.0" fill="rgb(241,97,1)" rx="2" ry="2" />
+<text  x="922.67" y="159.5" >__mom_..</text>
+</g>
+<g >
+<title>__memset_avx2_unaligned (4 samples, 0.02%)</title><rect x="473.4" y="133" width="0.2" height="15.0" fill="rgb(214,0,17)" rx="2" ry="2" />
+<text  x="476.37" y="143.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.01%)</title><rect x="1153.9" y="245" width="0.1" height="15.0" fill="rgb(229,81,15)" rx="2" ry="2" />
+<text  x="1156.91" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_sum_output_MOD_write_energy (10 samples, 0.06%)</title><rect x="30.2" y="181" width="0.7" height="15.0" fill="rgb(222,221,30)" rx="2" ry="2" />
+<text  x="33.23" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1173.0" y="197" width="0.2" height="15.0" fill="rgb(251,6,49)" rx="2" ry="2" />
+<text  x="1175.99" y="207.5" ></text>
+</g>
+<g >
+<title>next_format0 (3 samples, 0.02%)</title><rect x="1121.3" y="245" width="0.2" height="15.0" fill="rgb(242,219,18)" rx="2" ry="2" />
+<text  x="1124.31" y="255.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (5 samples, 0.03%)</title><rect x="1098.8" y="245" width="0.3" height="15.0" fill="rgb(251,124,51)" rx="2" ry="2" />
+<text  x="1101.79" y="255.5" ></text>
+</g>
+<g >
+<title>[libopen-pal.so.40.20.5] (2 samples, 0.01%)</title><rect x="12.8" y="261" width="0.2" height="15.0" fill="rgb(221,173,48)" rx="2" ry="2" />
+<text  x="15.82" y="271.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned (3 samples, 0.02%)</title><rect x="916.4" y="149" width="0.2" height="15.0" fill="rgb(213,216,15)" rx="2" ry="2" />
+<text  x="919.44" y="159.5" ></text>
+</g>
+<g >
+<title>PMPI_Wtime (2 samples, 0.01%)</title><rect x="11.9" y="261" width="0.1" height="15.0" fill="rgb(227,95,3)" rx="2" ry="2" />
+<text  x="14.88" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_ppm_limit_pos (190 samples, 1.08%)</title><rect x="425.2" y="117" width="12.8" height="15.0" fill="rgb(240,43,18)" rx="2" ry="2" />
+<text  x="428.24" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1173.0" y="213" width="0.2" height="15.0" fill="rgb(248,59,9)" rx="2" ry="2" />
+<text  x="1175.99" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1146.3" y="229" width="0.1" height="15.0" fill="rgb(229,10,1)" rx="2" ry="2" />
+<text  x="1149.31" y="239.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (2 samples, 0.01%)</title><rect x="1096.0" y="165" width="0.2" height="15.0" fill="rgb(215,97,22)" rx="2" ry="2" />
+<text  x="1099.04" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_kappa_shear_MOD_kappa_shear_column.constprop.0 (307 samples, 1.75%)</title><rect x="107.5" y="117" width="20.7" height="15.0" fill="rgb(230,208,25)" rx="2" ry="2" />
+<text  x="110.53" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_merid_flux_layer (568 samples, 3.24%)</title><rect x="375.0" y="117" width="38.1" height="15.0" fill="rgb(208,151,0)" rx="2" ry="2" />
+<text  x="377.97" y="127.5" >__m..</text>
+</g>
+<g >
+<title>__mom_barotropic_MOD_btcalc (103 samples, 0.59%)</title><rect x="165.6" y="165" width="6.9" height="15.0" fill="rgb(233,43,48)" rx="2" ry="2" />
+<text  x="168.60" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_pressureforce_fv_MOD_pressureforce_fv_bouss (1,432 samples, 8.16%)</title><rect x="714.3" y="165" width="96.3" height="15.0" fill="rgb(227,117,12)" rx="2" ry="2" />
+<text  x="717.33" y="175.5" >__mom_press..</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_logical (3 samples, 0.02%)</title><rect x="31.4" y="133" width="0.2" height="15.0" fill="rgb(235,40,7)" rx="2" ry="2" />
+<text  x="34.44" y="143.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned (2 samples, 0.01%)</title><rect x="59.3" y="149" width="0.2" height="15.0" fill="rgb(219,38,31)" rx="2" ry="2" />
+<text  x="62.33" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_diabatic_driver_MOD_diabatic_driver_init (34 samples, 0.19%)</title><rect x="31.4" y="181" width="2.3" height="15.0" fill="rgb(254,142,51)" rx="2" ry="2" />
+<text  x="34.37" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_lateral_mixing_coeffs_MOD_calc_slope_functions (49 samples, 0.28%)</title><rect x="1015.9" y="181" width="3.3" height="15.0" fill="rgb(207,42,51)" rx="2" ry="2" />
+<text  x="1018.92" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1183.5" y="229" width="0.2" height="15.0" fill="rgb(252,222,36)" rx="2" ry="2" />
+<text  x="1186.55" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="26.7" y="197" width="0.2" height="15.0" fill="rgb(225,115,15)" rx="2" ry="2" />
+<text  x="29.67" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_merid_flux_layer (746 samples, 4.25%)</title><rect x="312.4" y="133" width="50.1" height="15.0" fill="rgb(251,130,38)" rx="2" ry="2" />
+<text  x="315.39" y="143.5" >__mom..</text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="1097.6" y="181" width="0.1" height="15.0" fill="rgb(211,81,2)" rx="2" ry="2" />
+<text  x="1100.58" y="191.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (5 samples, 0.03%)</title><rect x="1015.5" y="133" width="0.3" height="15.0" fill="rgb(224,176,32)" rx="2" ry="2" />
+<text  x="1018.51" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_ppm_reconstruction_x (444 samples, 2.53%)</title><rect x="477.0" y="133" width="29.8" height="15.0" fill="rgb(241,64,15)" rx="2" ry="2" />
+<text  x="480.00" y="143.5" >__..</text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (10 samples, 0.06%)</title><rect x="29.5" y="197" width="0.7" height="15.0" fill="rgb(244,121,9)" rx="2" ry="2" />
+<text  x="32.49" y="207.5" ></text>
+</g>
+<g >
+<title>__mom_domains_MOD_create_vector_group_pass_2d (2 samples, 0.01%)</title><rect x="250.5" y="149" width="0.1" height="15.0" fill="rgb(238,140,41)" rx="2" ry="2" />
+<text  x="253.49" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_hor_visc_MOD_horizontal_viscosity (822 samples, 4.68%)</title><rect x="659.1" y="165" width="55.2" height="15.0" fill="rgb(205,53,16)" rx="2" ry="2" />
+<text  x="662.08" y="175.5" >__mom..</text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.07%)</title><rect x="722.9" y="101" width="0.8" height="15.0" fill="rgb(222,138,18)" rx="2" ry="2" />
+<text  x="725.93" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_obsolete_params_MOD_find_obsolete_params (5 samples, 0.03%)</title><rect x="40.2" y="181" width="0.3" height="15.0" fill="rgb(247,98,14)" rx="2" ry="2" />
+<text  x="43.18" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="26.7" y="213" width="0.2" height="15.0" fill="rgb(245,140,15)" rx="2" ry="2" />
+<text  x="29.67" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_mixed_layer_restrat_MOD_mixedlayer_restrat_bml (38 samples, 0.22%)</title><rect x="1019.2" y="181" width="2.6" height="15.0" fill="rgb(248,187,11)" rx="2" ry="2" />
+<text  x="1022.21" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.03%)</title><rect x="1177.7" y="229" width="0.4" height="15.0" fill="rgb(209,69,9)" rx="2" ry="2" />
+<text  x="1180.70" y="239.5" ></text>
+</g>
+<g >
+<title>_int_malloc (98 samples, 0.56%)</title><rect x="1146.6" y="261" width="6.6" height="15.0" fill="rgb(231,224,9)" rx="2" ry="2" />
+<text  x="1149.65" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (103 samples, 0.59%)</title><rect x="20.3" y="245" width="6.9" height="15.0" fill="rgb(234,73,14)" rx="2" ry="2" />
+<text  x="23.28" y="255.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (4 samples, 0.02%)</title><rect x="1129.4" y="261" width="0.2" height="15.0" fill="rgb(222,13,14)" rx="2" ry="2" />
+<text  x="1132.37" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.07%)</title><rect x="244.8" y="101" width="0.8" height="15.0" fill="rgb(242,62,5)" rx="2" ry="2" />
+<text  x="247.78" y="111.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (3 samples, 0.02%)</title><rect x="1025.7" y="165" width="0.2" height="15.0" fill="rgb(228,60,49)" rx="2" ry="2" />
+<text  x="1028.73" y="175.5" ></text>
+</g>
+<g >
+<title>[libopen-pal.so.40.20.5] (6 samples, 0.03%)</title><rect x="1177.7" y="245" width="0.4" height="15.0" fill="rgb(212,205,18)" rx="2" ry="2" />
+<text  x="1180.70" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_lateral_mixing_coeffs_MOD_varmix_init (8 samples, 0.05%)</title><rect x="39.4" y="181" width="0.6" height="15.0" fill="rgb(248,110,37)" rx="2" ry="2" />
+<text  x="42.44" y="191.5" ></text>
+</g>
+<g >
+<title>_dl_map_object (6 samples, 0.03%)</title><rect x="1145.6" y="261" width="0.4" height="15.0" fill="rgb(249,220,0)" rx="2" ry="2" />
+<text  x="1148.57" y="271.5" ></text>
+</g>
+<g >
+<title>H5SL_below (2 samples, 0.01%)</title><rect x="15.5" y="245" width="0.1" height="15.0" fill="rgb(225,0,23)" rx="2" ry="2" />
+<text  x="18.51" y="255.5" ></text>
+</g>
+<g >
+<title>_int_free (5 samples, 0.03%)</title><rect x="1181.9" y="245" width="0.3" height="15.0" fill="rgb(206,137,18)" rx="2" ry="2" />
+<text  x="1184.87" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_flow_control_MOD_call_tracer_register (3 samples, 0.02%)</title><rect x="42.9" y="181" width="0.2" height="15.0" fill="rgb(214,106,5)" rx="2" ry="2" />
+<text  x="45.93" y="191.5" ></text>
+</g>
+<g >
+<title>_int_malloc (30 samples, 0.17%)</title><rect x="1117.9" y="245" width="2.0" height="15.0" fill="rgb(209,63,43)" rx="2" ry="2" />
+<text  x="1120.88" y="255.5" ></text>
+</g>
+<g >
+<title>[libopen-pal.so.40.20.5] (13 samples, 0.07%)</title><rect x="19.3" y="245" width="0.9" height="15.0" fill="rgb(247,12,34)" rx="2" ry="2" />
+<text  x="22.34" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.07%)</title><rect x="22.8" y="213" width="0.8" height="15.0" fill="rgb(223,136,28)" rx="2" ry="2" />
+<text  x="25.77" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (13 samples, 0.07%)</title><rect x="110.8" y="69" width="0.9" height="15.0" fill="rgb(227,17,26)" rx="2" ry="2" />
+<text  x="113.82" y="79.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.02%)</title><rect x="1179.0" y="213" width="0.2" height="15.0" fill="rgb(215,100,42)" rx="2" ry="2" />
+<text  x="1181.98" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_register_diag_field_expand_cmor (2 samples, 0.01%)</title><rect x="31.9" y="149" width="0.1" height="15.0" fill="rgb(225,20,19)" rx="2" ry="2" />
+<text  x="34.91" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (21 samples, 0.12%)</title><rect x="722.3" y="149" width="1.4" height="15.0" fill="rgb(242,76,1)" rx="2" ry="2" />
+<text  x="725.33" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_isopycnal_slopes_MOD_vert_fill_ts (21 samples, 0.12%)</title><rect x="102.4" y="133" width="1.4" height="15.0" fill="rgb(251,186,8)" rx="2" ry="2" />
+<text  x="105.42" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_entrainment_diffusive (226 samples, 1.29%)</title><rect x="77.8" y="149" width="15.1" height="15.0" fill="rgb(237,176,0)" rx="2" ry="2" />
+<text  x="80.75" y="159.5" ></text>
+</g>
+<g >
+<title>do_lookup_x (54 samples, 0.31%)</title><rect x="1154.7" y="261" width="3.6" height="15.0" fill="rgb(237,84,46)" rx="2" ry="2" />
+<text  x="1157.71" y="271.5" ></text>
+</g>
+<g >
+<title>unlink_chunk.constprop.0 (27 samples, 0.15%)</title><rect x="1173.2" y="261" width="1.8" height="15.0" fill="rgb(211,138,31)" rx="2" ry="2" />
+<text  x="1176.20" y="271.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (56 samples, 0.32%)</title><rect x="47.2" y="181" width="3.7" height="15.0" fill="rgb(223,216,51)" rx="2" ry="2" />
+<text  x="50.17" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="23.4" y="197" width="0.2" height="15.0" fill="rgb(205,176,48)" rx="2" ry="2" />
+<text  x="26.44" y="207.5" ></text>
+</g>
+<g >
+<title>_gfortran_string_len_trim (2 samples, 0.01%)</title><rect x="38.3" y="149" width="0.1" height="15.0" fill="rgb(207,227,29)" rx="2" ry="2" />
+<text  x="41.30" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="1053.8" y="101" width="0.3" height="15.0" fill="rgb(234,94,10)" rx="2" ry="2" />
+<text  x="1056.76" y="111.5" ></text>
+</g>
+<g >
+<title>exp (2 samples, 0.01%)</title><rect x="131.1" y="149" width="0.2" height="15.0" fill="rgb(241,134,52)" rx="2" ry="2" />
+<text  x="134.12" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_set_diffusivity_MOD_set_bbl_tke (7 samples, 0.04%)</title><rect x="92.9" y="149" width="0.5" height="15.0" fill="rgb(251,86,53)" rx="2" ry="2" />
+<text  x="95.94" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_kappa_shear_MOD_calculate_kappa_shear (377 samples, 2.15%)</title><rect x="103.8" y="133" width="25.4" height="15.0" fill="rgb(237,174,50)" rx="2" ry="2" />
+<text  x="106.83" y="143.5" >_..</text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="245.4" y="53" width="0.2" height="15.0" fill="rgb(225,157,22)" rx="2" ry="2" />
+<text  x="248.38" y="63.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_meridional_mass_flux (2,553 samples, 14.54%)</title><rect x="266.7" y="149" width="171.6" height="15.0" fill="rgb(210,80,11)" rx="2" ry="2" />
+<text  x="269.69" y="159.5" >__mom_continuity_ppm_M..</text>
+</g>
+<g >
+<title>__mom_set_visc_MOD_set_u_at_v (4 samples, 0.02%)</title><rect x="1025.9" y="165" width="0.3" height="15.0" fill="rgb(228,189,28)" rx="2" ry="2" />
+<text  x="1028.93" y="175.5" ></text>
+</g>
+<g >
+<title>mca_pml_ob1_recv_request_get_frag (3 samples, 0.02%)</title><rect x="24.5" y="213" width="0.2" height="15.0" fill="rgb(250,215,23)" rx="2" ry="2" />
+<text  x="27.45" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_tracer_diabatic_MOD_tracer_vertdiff (14 samples, 0.08%)</title><rect x="129.8" y="117" width="1.0" height="15.0" fill="rgb(231,188,43)" rx="2" ry="2" />
+<text  x="132.84" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_read_param_real (2 samples, 0.01%)</title><rect x="32.6" y="117" width="0.1" height="15.0" fill="rgb(215,181,23)" rx="2" ry="2" />
+<text  x="35.58" y="127.5" ></text>
+</g>
+<g >
+<title>__libc_disable_asynccancel (4 samples, 0.02%)</title><rect x="1177.8" y="213" width="0.2" height="15.0" fill="rgb(235,70,16)" rx="2" ry="2" />
+<text  x="1180.77" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_dynamics_split_rk2_MOD_step_mom_dyn_split_rk2 (13,075 samples, 74.48%)</title><rect x="132.9" y="181" width="878.8" height="15.0" fill="rgb(228,180,17)" rx="2" ry="2" />
+<text  x="135.87" y="191.5" >__mom_dynamics_split_rk2_MOD_step_mom_dyn_split_rk2</text>
+</g>
+<g >
+<title>_int_free (2 samples, 0.01%)</title><rect x="1057.5" y="165" width="0.1" height="15.0" fill="rgb(238,165,51)" rx="2" ry="2" />
+<text  x="1060.46" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_1d (4 samples, 0.02%)</title><rect x="129.3" y="117" width="0.3" height="15.0" fill="rgb(238,1,26)" rx="2" ry="2" />
+<text  x="132.30" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_opacity_MOD_extract_optics_slice (5 samples, 0.03%)</title><rect x="70.4" y="117" width="0.3" height="15.0" fill="rgb(232,215,17)" rx="2" ry="2" />
+<text  x="73.36" y="127.5" ></text>
+</g>
+<g >
+<title>__GI___close_nocancel (2 samples, 0.01%)</title><rect x="1145.6" y="245" width="0.2" height="15.0" fill="rgb(209,128,28)" rx="2" ry="2" />
+<text  x="1148.64" y="255.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_downsample_mask_3d (4 samples, 0.02%)</title><rect x="34.5" y="165" width="0.2" height="15.0" fill="rgb(231,177,44)" rx="2" ry="2" />
+<text  x="37.47" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1183.5" y="213" width="0.2" height="15.0" fill="rgb(232,115,43)" rx="2" ry="2" />
+<text  x="1186.55" y="223.5" ></text>
+</g>
+<g >
+<title>__mom_eos_wright_MOD_calculate_density_derivs_array_wright (8 samples, 0.05%)</title><rect x="817.2" y="117" width="0.6" height="15.0" fill="rgb(225,114,52)" rx="2" ry="2" />
+<text  x="820.23" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_avx_unaligned_erms (4 samples, 0.02%)</title><rect x="52.1" y="165" width="0.2" height="15.0" fill="rgb(228,162,38)" rx="2" ry="2" />
+<text  x="55.08" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_diag_remap_MOD_diag_remap_update (2 samples, 0.01%)</title><rect x="33.9" y="165" width="0.2" height="15.0" fill="rgb(210,170,30)" rx="2" ry="2" />
+<text  x="36.93" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.03%)</title><rect x="245.2" y="69" width="0.4" height="15.0" fill="rgb(247,222,14)" rx="2" ry="2" />
+<text  x="248.25" y="79.5" ></text>
+</g>
+<g >
+<title>__mom_diag_mediator_MOD_register_diag_field_expand_cmor (2 samples, 0.01%)</title><rect x="43.3" y="149" width="0.2" height="15.0" fill="rgb(223,90,21)" rx="2" ry="2" />
+<text  x="46.34" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_merid_face_thickness (142 samples, 0.81%)</title><rect x="302.8" y="133" width="9.6" height="15.0" fill="rgb(254,191,53)" rx="2" ry="2" />
+<text  x="305.85" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_ppm_reconstruction_y (369 samples, 2.10%)</title><rect x="413.2" y="133" width="24.8" height="15.0" fill="rgb(249,159,52)" rx="2" ry="2" />
+<text  x="416.21" y="143.5" >_..</text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="489.0" y="85" width="0.5" height="15.0" fill="rgb(247,150,32)" rx="2" ry="2" />
+<text  x="492.03" y="95.5" ></text>
+</g>
+<g >
+<title>__mom_opacity_MOD_set_opacity (7 samples, 0.04%)</title><rect x="77.3" y="133" width="0.5" height="15.0" fill="rgb(226,221,40)" rx="2" ry="2" />
+<text  x="80.28" y="143.5" ></text>
+</g>
+<g >
+<title>__mom_file_parser_MOD_get_param_logical (2 samples, 0.01%)</title><rect x="36.9" y="149" width="0.1" height="15.0" fill="rgb(229,76,38)" rx="2" ry="2" />
+<text  x="39.89" y="159.5" ></text>
+</g>
+<g >
+<title>memset@plt (2 samples, 0.01%)</title><rect x="980.8" y="149" width="0.2" height="15.0" fill="rgb(212,143,19)" rx="2" ry="2" />
+<text  x="983.83" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1173.0" y="229" width="0.2" height="15.0" fill="rgb(219,78,26)" rx="2" ry="2" />
+<text  x="1175.99" y="239.5" ></text>
+</g>
+<g >
+<title>__memset_avx2_unaligned_erms (7 samples, 0.04%)</title><rect x="266.2" y="149" width="0.5" height="15.0" fill="rgb(249,118,20)" rx="2" ry="2" />
+<text  x="269.22" y="159.5" ></text>
+</g>
+<g >
+<title>__mom_vert_friction_MOD_vertvisc_init (3 samples, 0.02%)</title><rect x="37.8" y="165" width="0.2" height="15.0" fill="rgb(208,21,34)" rx="2" ry="2" />
+<text  x="40.83" y="175.5" ></text>
+</g>
+<g >
+<title>__ideal_age_example_MOD_ideal_age_tracer_column_physics (18 samples, 0.10%)</title><rect x="129.6" y="133" width="1.2" height="15.0" fill="rgb(223,106,37)" rx="2" ry="2" />
+<text  x="132.57" y="143.5" ></text>
+</g>
+<g >
+<title>__mpp_io_mod_MOD_mpp_write_meta_field (2 samples, 0.01%)</title><rect x="1144.2" y="261" width="0.1" height="15.0" fill="rgb(208,79,1)" rx="2" ry="2" />
+<text  x="1147.16" y="271.5" ></text>
+</g>
+<g >
+<title>__mom_eos_MOD_calculate_density_derivs_array (20 samples, 0.11%)</title><rect x="101.1" y="117" width="1.3" height="15.0" fill="rgb(206,168,43)" rx="2" ry="2" />
+<text  x="104.07" y="127.5" ></text>
+</g>
+<g >
+<title>__mom_thickness_diffuse_MOD_thickness_diffuse (415 samples, 2.36%)</title><rect x="1029.8" y="181" width="27.9" height="15.0" fill="rgb(231,200,8)" rx="2" ry="2" />
+<text  x="1032.76" y="191.5" >_..</text>
+</g>
+<g >
+<title>[libm-2.32.so] (8 samples, 0.05%)</title><rect x="41.2" y="165" width="0.5" height="15.0" fill="rgb(234,103,23)" rx="2" ry="2" />
+<text  x="44.19" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_continuity_ppm_MOD_meridional_flux_adjust.constprop.0 (753 samples, 4.29%)</title><rect x="362.5" y="133" width="50.6" height="15.0" fill="rgb(237,163,7)" rx="2" ry="2" />
+<text  x="365.53" y="143.5" >__mom..</text>
+</g>
+<g >
+<title>__mom_entrain_diffusive_MOD_determine_ea_kb.constprop.1 (66 samples, 0.38%)</title><rect x="86.4" y="133" width="4.5" height="15.0" fill="rgb(239,208,25)" rx="2" ry="2" />
+<text  x="89.42" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1185.0" y="165" width="0.2" height="15.0" fill="rgb(216,197,27)" rx="2" ry="2" />
+<text  x="1188.03" y="175.5" ></text>
+</g>
+<g >
+<title>__mom_diabatic_driver_MOD_diabatic (1,170 samples, 6.66%)</title><rect x="52.6" y="165" width="78.7" height="15.0" fill="rgb(236,84,36)" rx="2" ry="2" />
+<text  x="55.61" y="175.5" >__mom_dia..</text>
+</g>
+<g >
+<title>_gfortran_compare_string (5 samples, 0.03%)</title><rect x="1102.6" y="245" width="0.4" height="15.0" fill="rgb(235,149,28)" rx="2" ry="2" />
+<text  x="1105.62" y="255.5" ></text>
+</g>
+</g>
+</svg>
